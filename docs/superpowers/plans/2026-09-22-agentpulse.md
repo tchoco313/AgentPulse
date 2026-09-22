@@ -2545,7 +2545,7 @@ cd ~/Workspaces/13_AgentPulse
 python3 -m unittest tests.test_server -v
 ```
 
-Expected: PASS — 15 tests
+Expected: PASS — 25 tests
 
 - [ ] **Step 5: 전체 테스트를 돌린다**
 
@@ -2928,9 +2928,24 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 **Interfaces:**
 - Consumes: `config.load_config`
 - Produces: 실행 가능한 스크립트. Claude Code가 Stop 훅으로 부른다.
-  - `hooks.context_alert.should_alert(payload: dict, cfg: dict, seen: dict) -> tuple[bool, dict]`
+  - `hooks.context_alert.context_used(transcript_path) -> int | None`
+  - `hooks.context_alert.should_alert(payload, cfg, seen, used) -> tuple[bool, dict]`
     반환 `(발화할지, 갱신된 seen)`
-  - `hooks.context_alert.message(payload: dict, cfg: dict) -> tuple[str, str]` — `(제목, 본문)`
+  - `hooks.context_alert.message(used: int, cfg: dict) -> tuple[str, str]` — `(제목, 본문)`
+
+  **실측한 Stop 훅 payload** (2026-09-22, 실제 캡처):
+
+  ```
+  background_tasks, cwd, effort, hook_event_name, last_assistant_message,
+  permission_mode, prompt_id, scratchpad_dir, session_crons, session_id,
+  stop_hook_active, transcript_path
+  ```
+
+  `context_window`가 **없다**. statusline payload에는 있지만 Stop 훅에는 없다.
+  그래서 훅은 `transcript_path`를 직접 읽어 점유를 계산한다. 확인된 등가성:
+  statusline이 보고한 `total_input_tokens` 561,488과
+  `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`
+  (2 + 560,864 + 622)가 정확히 일치한다.
 
 - [ ] **Step 1: 실패하는 테스트를 쓴다**
 
@@ -2952,56 +2967,115 @@ CFG = {"context_limit": 1_000_000, "warn_threshold": 0.85,
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def payload(pct=90.0, session="s1"):
-    return {"session_id": session, "context_window": {"used_percentage": pct}}
+def rec(used, sidechain=False, kind="assistant"):
+    return json.dumps({
+        "type": kind, "sessionId": "s1", "isSidechain": sidechain,
+        "message": {"role": "assistant", "model": "m",
+                    "usage": {"input_tokens": 0,
+                              "cache_read_input_tokens": used,
+                              "cache_creation_input_tokens": 0}},
+    })
+
+
+def transcript(lines):
+    d = Path(tempfile.mkdtemp())
+    p = d / "t.jsonl"
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return p
+
+
+def payload(session="s1", transcript_path=""):
+    # 실측한 Stop 훅 payload에는 context_window가 없다. session_id와
+    # transcript_path가 훅이 쓰는 전부다.
+    return {"session_id": session, "transcript_path": str(transcript_path),
+            "hook_event_name": "Stop", "cwd": "/Users/teo"}
+
+
+class TestContextUsed(unittest.TestCase):
+    def test_reads_last_assistant_usage(self):
+        p = transcript([rec(100), rec(900_000)])
+        self.assertEqual(alert.context_used(p), 900_000)
+
+    def test_skips_sidechain_records(self):
+        # 서브에이전트는 부모와 세션 id를 공유한다. 그 점유는 사용자 것이 아니다.
+        p = transcript([rec(900_000), rec(50, sidechain=True)])
+        self.assertEqual(alert.context_used(p), 900_000)
+
+    def test_ignores_non_assistant_records(self):
+        p = transcript([rec(900_000), rec(1, kind="user")])
+        self.assertEqual(alert.context_used(p), 900_000)
+
+    def test_broken_lines_are_skipped(self):
+        p = transcript([rec(900_000), "{깨진 줄"])
+        self.assertEqual(alert.context_used(p), 900_000)
+
+    def test_no_assistant_records_gives_none(self):
+        p = transcript([rec(1, kind="user")])
+        self.assertIsNone(alert.context_used(p))
+
+    def test_missing_file_gives_none(self):
+        self.assertIsNone(alert.context_used("/nonexistent/t.jsonl"))
+
+    def test_empty_path_gives_none(self):
+        self.assertIsNone(alert.context_used(""))
+
+    def test_finds_recent_record_in_a_file_larger_than_the_tail(self):
+        # 꼬리만 읽는다. 오래된 줄로 파일을 부풀려도 최근 값을 찾아야 한다.
+        filler = [rec(1)] * 4000
+        p = transcript(filler + [rec(777_000)])
+        self.assertGreater(p.stat().st_size, alert.TAIL_BYTES)
+        self.assertEqual(alert.context_used(p), 777_000)
 
 
 class TestShouldAlert(unittest.TestCase):
     def test_below_threshold_is_quiet(self):
-        fire, _ = alert.should_alert(payload(pct=50.0), CFG, {})
+        fire, _ = alert.should_alert(payload(), CFG, {}, 500_000)
         self.assertFalse(fire)
 
     def test_above_threshold_fires(self):
-        fire, seen = alert.should_alert(payload(pct=90.0), CFG, {})
+        fire, seen = alert.should_alert(payload(), CFG, {}, 900_000)
         self.assertTrue(fire)
         self.assertIn("s1", seen)
 
     def test_exactly_at_threshold_fires(self):
-        fire, _ = alert.should_alert(payload(pct=85.0), CFG, {})
+        fire, _ = alert.should_alert(payload(), CFG, {}, 850_000)
         self.assertTrue(fire)
 
     def test_same_session_fires_only_once(self):
-        fire, seen = alert.should_alert(payload(pct=90.0), CFG, {})
+        fire, seen = alert.should_alert(payload(), CFG, {}, 900_000)
         self.assertTrue(fire)
-        fire2, _ = alert.should_alert(payload(pct=95.0), CFG, seen)
+        fire2, _ = alert.should_alert(payload(), CFG, seen, 950_000)
         self.assertFalse(fire2)
 
     def test_different_session_fires_separately(self):
-        _, seen = alert.should_alert(payload(pct=90.0, session="s1"), CFG, {})
-        fire, _ = alert.should_alert(payload(pct=90.0, session="s2"), CFG, seen)
+        _, seen = alert.should_alert(payload(session="s1"), CFG, {}, 900_000)
+        fire, _ = alert.should_alert(payload(session="s2"), CFG, seen, 900_000)
         self.assertTrue(fire)
 
-    def test_missing_context_window_is_quiet(self):
-        fire, _ = alert.should_alert({"session_id": "s1"}, CFG, {})
+    def test_unknown_usage_is_quiet(self):
+        fire, _ = alert.should_alert(payload(), CFG, {}, None)
         self.assertFalse(fire)
 
     def test_missing_session_id_is_quiet(self):
-        fire, _ = alert.should_alert({"context_window": {"used_percentage": 99}},
-                                     CFG, {})
+        fire, _ = alert.should_alert({"transcript_path": "/x"}, CFG, {}, 900_000)
+        self.assertFalse(fire)
+
+    def test_zero_limit_is_quiet_not_a_division_error(self):
+        cfg = {**CFG, "context_limit": 0}
+        fire, _ = alert.should_alert(payload(), cfg, {}, 900_000)
         self.assertFalse(fire)
 
 
 class TestMessage(unittest.TestCase):
     def test_message_reports_percent_and_remaining(self):
-        title, body = alert.message(payload(pct=90.0), CFG)
+        title, body = alert.message(900_000, CFG)
         self.assertIn("90%", body)
-        self.assertIn("100K", body)  # 1,000,000의 10%
+        self.assertIn("100K", body)
         self.assertTrue(title)
 
-    def test_message_has_no_shell_metacharacters_from_input(self):
-        # osascript에 문자열을 넘기므로 따옴표가 새어나가면 안 된다
-        p = {"session_id": 's"1', "context_window": {"used_percentage": 90.0}}
-        _, body = alert.message(p, CFG)
+    def test_message_has_no_quotes(self):
+        # osascript에 넘기는 문자열이라 따옴표가 새어나가면 안 된다
+        _, body = alert.message(900_000, CFG)
         self.assertNotIn('"', body)
 
 
@@ -3033,9 +3107,18 @@ class TestScriptNeverFails(unittest.TestCase):
 
     def test_dry_run_prints_when_over_threshold(self):
         d = Path(tempfile.mkdtemp())
-        r = self.run_script(json.dumps(payload(pct=99.0)), d / "alerted.json")
+        p = transcript([rec(990_000)])
+        r = self.run_script(json.dumps(payload(transcript_path=p)),
+                            d / "alerted.json")
         self.assertEqual(r.returncode, 0)
         self.assertIn("99", r.stdout)
+
+    def test_quiet_when_transcript_missing(self):
+        d = Path(tempfile.mkdtemp())
+        r = self.run_script(json.dumps(payload(transcript_path="/nope.jsonl")),
+                            d / "alerted.json")
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.stdout, "")
 
     def test_works_from_an_unrelated_cwd(self):
         """Claude Code는 사용자의 프로젝트 디렉터리를 cwd로 훅을 실행한다.
@@ -3044,20 +3127,23 @@ class TestScriptNeverFails(unittest.TestCase):
         그래서 이 테스트가 없으면 훅이 실무에서 조용히 죽는 것을 못 잡는다.
         """
         d = Path(tempfile.mkdtemp())
-        r = self.run_script(json.dumps(payload(pct=99.0)),
+        p = transcript([rec(990_000)])
+        r = self.run_script(json.dumps(payload(transcript_path=p)),
                             d / "alerted.json", cwd=d)
         self.assertEqual(r.returncode, 0)
         self.assertIn("99", r.stdout)
         self.assertEqual(r.stderr, "")
 
     def test_unwritable_alerted_path_exits_zero(self):
-        r = self.run_script(json.dumps(payload(pct=99.0)),
+        p = transcript([rec(990_000)])
+        r = self.run_script(json.dumps(payload(transcript_path=p)),
                             "/nonexistent-root/alerted.json")
         self.assertEqual(r.returncode, 0)
 
     def test_unwritable_alerted_path_does_not_alert_every_turn(self):
         """기록이 안 되면 조용히 넘어간다. 턴마다 울리는 알림이 더 나쁘다."""
-        outs = [self.run_script(json.dumps(payload(pct=99.0)),
+        p = transcript([rec(990_000)])
+        outs = [self.run_script(json.dumps(payload(transcript_path=p)),
                                 "/nonexistent-root/alerted.json").stdout
                 for _ in range(3)]
         self.assertEqual(outs, ["", "", ""])
@@ -3091,6 +3177,7 @@ Claude Code의 턴이 막힌다.
 """
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -3103,6 +3190,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 CLAUDE_DIR = Path.home() / ".claude"
 DEFAULT_ALERTED_PATH = CLAUDE_DIR / "pulse-alerted.json"
 
+TAIL_BYTES = 512 * 1024
+
 
 def _human(n):
     if n >= 1_000_000:
@@ -3112,26 +3201,78 @@ def _human(n):
     return str(n)
 
 
-def should_alert(payload, cfg, seen):
+def _tail_lines(path, max_bytes=TAIL_BYTES):
+    """파일 끝에서 최대 max_bytes만 읽어 줄 목록으로 돌려준다.
+
+    훅은 매 턴 돈다. 트랜스크립트는 수십 MB까지 자라므로 전체를 읽으면
+    턴마다 지연이 붙는다.
+    """
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        start = max(0, size - max_bytes)
+        f.seek(start)
+        data = f.read()
+    lines = data.split(b"\n")
+    if start:
+        lines = lines[1:]  # 잘렸을 첫 줄은 버린다
+    return lines
+
+
+def context_used(transcript_path):
+    """세션의 현재 컨텍스트 점유(토큰). 알 수 없으면 None.
+
+    Stop 훅 payload에는 context_window가 없다(실측). transcript_path는 있으므로
+    마지막 assistant 레코드의 usage에서 직접 계산한다. 서브에이전트(isSidechain)
+    레코드는 부모와 세션 id를 공유하므로 건너뛴다 — 그러지 않으면 서브에이전트의
+    점유를 사용자 것으로 착각한다.
+    """
+    if not transcript_path:
+        return None
+    try:
+        lines = _tail_lines(transcript_path)
+    except OSError:
+        return None
+
+    for raw in reversed(lines):
+        if not raw.strip():
+            continue
+        try:
+            d = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(d, dict) or d.get("type") != "assistant":
+            continue
+        if d.get("isSidechain"):
+            continue
+        usage = (d.get("message") or {}).get("usage") or {}
+        if not usage:
+            continue
+        return (usage.get("input_tokens", 0)
+                + usage.get("cache_read_input_tokens", 0)
+                + usage.get("cache_creation_input_tokens", 0))
+    return None
+
+
+def should_alert(payload, cfg, seen, used):
     """(발화할지, 갱신된 seen). 세션당 한 번만 발화한다."""
     session = payload.get("session_id")
-    window = payload.get("context_window") or {}
-    pct = window.get("used_percentage")
+    limit = cfg["context_limit"]
 
-    if not session or not isinstance(pct, (int, float)):
+    if not session or used is None or not limit:
         return False, seen
-    if pct / 100 < cfg["warn_threshold"]:
+    if used / limit < cfg["warn_threshold"]:
         return False, seen
     if session in seen:
         return False, seen
 
-    return True, {**seen, session: pct}
+    return True, {**seen, session: round(used / limit * 100, 1)}
 
 
-def message(payload, cfg):
-    pct = (payload.get("context_window") or {}).get("used_percentage") or 0
+def message(used, cfg):
     limit = cfg["context_limit"]
-    remaining = max(0, int(limit * (100 - pct) / 100))
+    pct = used / limit * 100
+    remaining = max(0, limit - used)
     title = "컨텍스트 경고"
     body = (f"컨텍스트 {pct:.0f}% 사용 · 약 {_human(remaining)} 남음. "
             f"정리하거나 새 세션으로 옮길 때입니다.")
@@ -3171,7 +3312,8 @@ def main():
     except (OSError, ValueError):
         seen = {}
 
-    fire, seen = should_alert(payload, cfg, seen)
+    used = context_used(payload.get("transcript_path"))
+    fire, seen = should_alert(payload, cfg, seen, used)
     if not fire:
         return
 
@@ -3181,7 +3323,7 @@ def main():
     alerted_path.parent.mkdir(parents=True, exist_ok=True)
     alerted_path.write_text(json.dumps(seen), encoding="utf-8")
 
-    title, body = message(payload, cfg)
+    title, body = message(used, cfg)
     if args.dry_run:
         print(f"{title}: {body}")
     else:
@@ -3213,9 +3355,15 @@ Expected: PASS — 15 tests
 
 ```bash
 cd ~/Workspaces/13_AgentPulse
-echo '{"session_id":"manual-test","context_window":{"used_percentage":91}}' \
-  | python3 hooks/context_alert.py --alerted-path /tmp/pulse-alerted-test.json
-rm -f /tmp/pulse-alerted-test.json
+python3 -c "
+import json, pathlib
+p = pathlib.Path('/tmp/pulse-manual-transcript.jsonl')
+p.write_text(json.dumps({'type':'assistant','isSidechain':False,'message':{
+  'role':'assistant','model':'m','usage':{'input_tokens':0,
+  'cache_read_input_tokens':910000,'cache_creation_input_tokens':0}}}) + '\n')
+print(json.dumps({'session_id':'manual-test','transcript_path':str(p)}))
+" | python3 hooks/context_alert.py --alerted-path /tmp/pulse-alerted-test.json
+rm -f /tmp/pulse-alerted-test.json /tmp/pulse-manual-transcript.jsonl
 ```
 
 Expected: macOS 알림 배너가 뜬다. 안 뜨면 시스템 설정 → 알림에서 터미널 앱의 알림이 꺼져 있는지 확인한다.
