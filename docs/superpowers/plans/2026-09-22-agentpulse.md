@@ -616,8 +616,10 @@ class TestFindTranscripts(unittest.TestCase):
 
         found = scan.find_transcripts(root)
 
+        # 전체 경로로 정렬하므로 proj/main.jsonl 이
+        # proj/sess/subagents/agent-x.jsonl 보다 앞선다
         self.assertEqual([Path(p).name for p in found],
-                         ["agent-x.jsonl", "main.jsonl"])
+                         ["main.jsonl", "agent-x.jsonl"])
 
     def test_missing_root_gives_empty_list(self):
         self.assertEqual(scan.find_transcripts("/nonexistent/projects"), [])
