@@ -45,6 +45,9 @@ class ServerTestCase(unittest.TestCase):
         self.httpd = server.make_server(state, port=0, web_dir=self.web)
         self.port = self.httpd.server_address[1]
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        # LIFO로 돌기 때문에 shutdown이 먼저, 그 다음 server_close다.
+        # server_close를 빠뜨리면 듣던 소켓이 남아 ResourceWarning이 뜬다.
+        self.addCleanup(self.httpd.server_close)
         self.addCleanup(self.httpd.shutdown)
 
     def get(self, path):
