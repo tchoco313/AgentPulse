@@ -80,11 +80,19 @@ class TestParseLine(unittest.TestCase):
         events = scan.parse_line(line)
         self.assertEqual(events[0]["kind"], "activity")
 
-    def test_broken_json_returns_none(self):
-        self.assertIsNone(scan.parse_line("{not json"))
+    def test_broken_json_returns_malformed(self):
+        self.assertIs(scan.parse_line("{not json"), scan.MALFORMED)
+
+    def test_non_object_json_is_malformed(self):
+        self.assertIs(scan.parse_line("[1, 2, 3]"), scan.MALFORMED)
 
     def test_uninteresting_line_returns_none(self):
         self.assertIsNone(scan.parse_line(json.dumps({"type": "mode", "mode": "x"})))
+
+    def test_uninteresting_lines_are_not_counted_as_bad(self):
+        # JSONL은 모든 줄이 '{'로 시작한다 — 모양으로 구분하면 전부 깨진 줄이 된다
+        self.assertIsNone(scan.parse_line(json.dumps({"type": "attachment"})))
+        self.assertIsNone(scan.parse_line(json.dumps({"type": "last-prompt"})))
 
 
 class TestScanFile(unittest.TestCase):
@@ -111,6 +119,16 @@ class TestScanFile(unittest.TestCase):
         events, _, bad = scan.scan_file(self.path, 0)
         self.assertEqual(len([e for e in events if e["kind"] == "usage"]), 2)
         self.assertEqual(bad, 1)
+
+    def test_routine_records_are_not_counted_as_bad(self):
+        # 실제 코퍼스의 첫 파일: 파싱 실패 0건인데 52건으로 세던 회귀
+        self.write([json.dumps({"type": "attachment", "sessionId": "s1"}),
+                    json.dumps({"type": "mode", "mode": "x"}),
+                    json.dumps({"type": "last-prompt", "lastPrompt": "x"}),
+                    assistant_line(usage={"input_tokens": 1})])
+        events, _, bad = scan.scan_file(self.path, 0)
+        self.assertEqual(bad, 0)
+        self.assertEqual(len([e for e in events if e["kind"] == "usage"]), 1)
 
     def test_incremental_reads_only_new_lines(self):
         self.write([assistant_line(usage={"input_tokens": 1})])
@@ -168,6 +186,19 @@ class TestFindTranscripts(unittest.TestCase):
         found = scan.find_transcripts(root)
 
         self.assertEqual([Path(p).name for p in found], ["a.jsonl", "b.jsonl"])
+
+    def test_finds_subagent_transcripts(self):
+        # 실측 117개 중 53개가 <프로젝트>/<세션>/subagents/ 아래에 있다
+        root = Path(tempfile.mkdtemp())
+        (root / "proj" / "sess" / "subagents").mkdir(parents=True)
+        (root / "proj" / "main.jsonl").write_text("", encoding="utf-8")
+        (root / "proj" / "sess" / "subagents" / "agent-x.jsonl").write_text(
+            "", encoding="utf-8")
+
+        found = scan.find_transcripts(root)
+
+        self.assertEqual([Path(p).name for p in found],
+                         ["main.jsonl", "agent-x.jsonl"])
 
     def test_missing_root_gives_empty_list(self):
         self.assertEqual(scan.find_transcripts("/nonexistent/projects"), [])

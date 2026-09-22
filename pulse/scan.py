@@ -6,12 +6,20 @@ import json
 from pathlib import Path
 
 
+MALFORMED = object()
+"""파싱 실패를 뜻하는 센티널. '관심 없는 줄'(None)과 구분하기 위해 필요하다."""
+
+
 def find_transcripts(root):
-    """<root>/<project>/<session>.jsonl 들을 정렬해 돌려준다."""
+    """루트 아래 모든 .jsonl을 정렬해 돌려준다.
+
+    서브에이전트 트랜스크립트가 <프로젝트>/<세션>/subagents/ 아래에 있어서
+    2단계 glob으로는 절반 가까이를 놓친다.
+    """
     root = Path(root)
     if not root.is_dir():
         return []
-    return sorted(str(p) for p in root.glob("*/*.jsonl"))
+    return sorted(str(p) for p in root.rglob("*.jsonl"))
 
 
 def _int(d, key):
@@ -20,13 +28,13 @@ def _int(d, key):
 
 
 def parse_line(line):
-    """한 줄 -> 이벤트 리스트. 관심 없거나 깨진 줄은 None."""
+    """한 줄 -> 이벤트 리스트. 관심 없으면 None, 파싱 실패면 MALFORMED."""
     try:
         d = json.loads(line)
     except ValueError:
-        return None
+        return MALFORMED
     if not isinstance(d, dict):
-        return None
+        return MALFORMED
 
     kind = d.get("type")
     session = d.get("sessionId") or ""
@@ -92,9 +100,10 @@ def scan_file(path, offset=0):
                 if not text:
                     continue
                 parsed = parse_line(text)
+                if parsed is MALFORMED:
+                    bad += 1
+                    continue
                 if parsed is None:
-                    if text.startswith("{"):
-                        bad += 1
                     continue
                 events.extend(parsed)
     except OSError:
