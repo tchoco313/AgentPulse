@@ -1,5 +1,67 @@
 <!doctype html>
 <html lang="ko">
-<head><meta charset="utf-8"><title>AgentPulse</title></head>
-<body><h1>AgentPulse</h1></body>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AgentPulse</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="bar">
+  <h1>AgentPulse</h1>
+  <span class="tag">Claude Code</span>
+  <span class="spacer"></span>
+  <span id="conn" class="conn">연결 중</span>
+</header>
+
+<section class="block">
+  <h2>실시간 세션 · 컨텍스트 창
+    <small>최근 15분 안에 활동한 세션 · 5초마다 갱신 · 요금제 사용 한도와는 별개</small>
+  </h2>
+  <div id="sessions" class="cards"></div>
+</section>
+
+<section class="block">
+  <h2>사용량 <small id="range-note"></small></h2>
+  <div class="tabs" id="range-tabs">
+    <button data-range="7d" class="on">최근 7일</button>
+    <button data-range="30d">최근 30일</button>
+    <button data-range="all">전체</button>
+  </div>
+
+  <div class="tiles">
+    <div class="tile"><span class="k">도구 호출</span>
+      <strong id="t-calls">–</strong><span class="s" id="t-calls-sub"></span></div>
+    <div class="tile"><span class="k">처리 토큰</span>
+      <strong id="t-tokens">–</strong><span class="s" id="t-tokens-sub"></span></div>
+    <div class="tile"><span class="k">컨텍스트 압축</span>
+      <strong id="t-compact">–</strong><span class="s" id="t-compact-sub"></span></div>
+    <div class="tile"><span class="k">기간 내 미사용</span>
+      <strong id="t-unused">–</strong><span class="s">설치된 MCP 서버 · 스킬 중</span></div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-head"><h3>일별 호출 수</h3>
+      <div class="legend">
+        <span><i class="sw sw-mcp"></i>MCP</span>
+        <span><i class="sw sw-skill"></i>Skill</span>
+        <span><i class="sw sw-tools"></i>Tools</span>
+      </div>
+    </div>
+    <div id="chart"></div>
+  </div>
+
+  <div class="ranks">
+    <div class="panel"><div class="panel-head"><h3><i class="sw sw-mcp"></i>MCP</h3>
+      <small id="n-mcp"></small></div><ol id="r-mcp" class="rank"></ol></div>
+    <div class="panel"><div class="panel-head"><h3><i class="sw sw-skill"></i>Skill</h3>
+      <small id="n-skill"></small></div><ol id="r-skill" class="rank"></ol></div>
+    <div class="panel"><div class="panel-head"><h3><i class="sw sw-tools"></i>Tools</h3>
+      <small id="n-tools"></small></div><ol id="r-tools" class="rank"></ol></div>
+  </div>
+</section>
+
+<footer id="foot" class="foot"></footer>
+<script src="app.js"></script>
+</body>
 </html>
