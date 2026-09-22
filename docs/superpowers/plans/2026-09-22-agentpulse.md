@@ -386,10 +386,18 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 **Interfaces:**
 - Consumes: 없음
 - Produces:
-  - `pulse.scan.parse_line(line: str) -> dict | None` — 관심 없는 줄과 깨진 줄은 `None`
+  - `pulse.scan.MALFORMED` — 파싱 실패를 뜻하는 센티널 객체
+  - `pulse.scan.parse_line(line: str) -> list[dict] | None | MALFORMED`
+    관심 없는 레코드는 `None`, JSON 파싱 실패는 `MALFORMED`.
+    **둘을 반드시 구분한다** — JSONL은 모든 줄이 `{`로 시작하므로 `scan_file`이
+    문자열 모양으로 깨진 줄을 알아낼 방법이 없다. 섞으면 attachment·mode 같은
+    평범한 레코드가 전부 "읽지 못한 줄"로 집계된다(실측: 한 파일에서 0건이 52건으로).
   - `pulse.scan.scan_file(path, offset: int = 0) -> tuple[list[dict], int, int]`
     반환: `(events, new_offset, bad_lines)`
-  - `pulse.scan.find_transcripts(root) -> list[str]` — 정렬된 절대경로
+  - `pulse.scan.find_transcripts(root) -> list[str]` — 정렬된 절대경로.
+    루트 아래 **모든** `.jsonl`을 재귀로 찾는다. 서브에이전트 트랜스크립트가
+    `<프로젝트>/<세션>/subagents/agent-*.jsonl`에 있고, 실측 117개 중 53개가
+    거기 있다 — 2단계만 훑으면 토큰·호출 총계의 45%가 빠진다.
 
   **정규화 이벤트 형태** (뒤 태스크가 전부 이 형태에 의존한다):
 
@@ -491,11 +499,19 @@ class TestParseLine(unittest.TestCase):
         events = scan.parse_line(line)
         self.assertEqual(events[0]["kind"], "activity")
 
-    def test_broken_json_returns_none(self):
-        self.assertIsNone(scan.parse_line("{not json"))
+    def test_broken_json_returns_malformed(self):
+        self.assertIs(scan.parse_line("{not json"), scan.MALFORMED)
+
+    def test_non_object_json_is_malformed(self):
+        self.assertIs(scan.parse_line("[1, 2, 3]"), scan.MALFORMED)
 
     def test_uninteresting_line_returns_none(self):
         self.assertIsNone(scan.parse_line(json.dumps({"type": "mode", "mode": "x"})))
+
+    def test_uninteresting_lines_are_not_counted_as_bad(self):
+        # JSONL은 모든 줄이 '{'로 시작한다 — 모양으로 구분하면 전부 깨진 줄이 된다
+        self.assertIsNone(scan.parse_line(json.dumps({"type": "attachment"})))
+        self.assertIsNone(scan.parse_line(json.dumps({"type": "last-prompt"})))
 
 
 class TestScanFile(unittest.TestCase):
@@ -522,6 +538,16 @@ class TestScanFile(unittest.TestCase):
         events, _, bad = scan.scan_file(self.path, 0)
         self.assertEqual(len([e for e in events if e["kind"] == "usage"]), 2)
         self.assertEqual(bad, 1)
+
+    def test_routine_records_are_not_counted_as_bad(self):
+        # 실제 코퍼스의 첫 파일: 파싱 실패 0건인데 52건으로 세던 회귀
+        self.write([json.dumps({"type": "attachment", "sessionId": "s1"}),
+                    json.dumps({"type": "mode", "mode": "x"}),
+                    json.dumps({"type": "last-prompt", "lastPrompt": "x"}),
+                    assistant_line(usage={"input_tokens": 1})])
+        events, _, bad = scan.scan_file(self.path, 0)
+        self.assertEqual(bad, 0)
+        self.assertEqual(len([e for e in events if e["kind"] == "usage"]), 1)
 
     def test_incremental_reads_only_new_lines(self):
         self.write([assistant_line(usage={"input_tokens": 1})])
@@ -580,6 +606,19 @@ class TestFindTranscripts(unittest.TestCase):
 
         self.assertEqual([Path(p).name for p in found], ["a.jsonl", "b.jsonl"])
 
+    def test_finds_subagent_transcripts(self):
+        # 실측 117개 중 53개가 <프로젝트>/<세션>/subagents/ 아래에 있다
+        root = Path(tempfile.mkdtemp())
+        (root / "proj" / "sess" / "subagents").mkdir(parents=True)
+        (root / "proj" / "main.jsonl").write_text("", encoding="utf-8")
+        (root / "proj" / "sess" / "subagents" / "agent-x.jsonl").write_text(
+            "", encoding="utf-8")
+
+        found = scan.find_transcripts(root)
+
+        self.assertEqual([Path(p).name for p in found],
+                         ["agent-x.jsonl", "main.jsonl"])
+
     def test_missing_root_gives_empty_list(self):
         self.assertEqual(scan.find_transcripts("/nonexistent/projects"), [])
 
@@ -610,12 +649,20 @@ import json
 from pathlib import Path
 
 
+MALFORMED = object()
+"""파싱 실패를 뜻하는 센티널. '관심 없는 줄'(None)과 구분하기 위해 필요하다."""
+
+
 def find_transcripts(root):
-    """<root>/<project>/<session>.jsonl 들을 정렬해 돌려준다."""
+    """루트 아래 모든 .jsonl을 정렬해 돌려준다.
+
+    서브에이전트 트랜스크립트가 <프로젝트>/<세션>/subagents/ 아래에 있어서
+    2단계 glob으로는 절반 가까이를 놓친다.
+    """
     root = Path(root)
     if not root.is_dir():
         return []
-    return sorted(str(p) for p in root.glob("*/*.jsonl"))
+    return sorted(str(p) for p in root.rglob("*.jsonl"))
 
 
 def _int(d, key):
@@ -624,13 +671,13 @@ def _int(d, key):
 
 
 def parse_line(line):
-    """한 줄 -> 이벤트 리스트. 관심 없거나 깨진 줄은 None."""
+    """한 줄 -> 이벤트 리스트. 관심 없으면 None, 파싱 실패면 MALFORMED."""
     try:
         d = json.loads(line)
     except ValueError:
-        return None
+        return MALFORMED
     if not isinstance(d, dict):
-        return None
+        return MALFORMED
 
     kind = d.get("type")
     session = d.get("sessionId") or ""
@@ -696,9 +743,10 @@ def scan_file(path, offset=0):
                 if not text:
                     continue
                 parsed = parse_line(text)
+                if parsed is MALFORMED:
+                    bad += 1
+                    continue
                 if parsed is None:
-                    if text.startswith("{"):
-                        bad += 1
                     continue
                 events.extend(parsed)
     except OSError:
@@ -714,7 +762,7 @@ cd ~/Workspaces/13_AgentPulse
 python3 -m unittest tests.test_scan -v
 ```
 
-Expected: PASS — 16 tests
+Expected: PASS — 20 tests
 
 - [ ] **Step 5: 실제 데이터로 한 번 돌려본다**
 
@@ -757,7 +805,8 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
     반환 `(group, label)`, group은 `"mcp" | "skill" | "tools"` 중 하나
   - `pulse.aggregate.local_day(ts: str) -> str` — `"YYYY-MM-DD"`, 로컬 타임존 기준
   - `pulse.aggregate.empty_partial() -> dict`
-  - `pulse.aggregate.fold(events: list[dict], partial: dict | None = None) -> dict`
+  - `pulse.aggregate.fold(events, partial=None, subagent=False) -> dict`
+    `subagent=True`면 이 파일에서 본 세션에 `"sub": True`를 심는다.
   - `pulse.aggregate.merge(partials: list[dict], since: str | None = None) -> dict`
 
   **partial 형태:**
@@ -770,7 +819,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
    "compacts": [{"ts": str, "day": str, "trigger": str, "pre": int, "post": int,
                  "dropped": int}],
    "sessions": {"<sid>": {"title": str | None, "cwd": str, "model": str,
-                          "last_ts": str, "last_ctx": int | None}},
+                          "last_ts": str, "last_ctx": int | None, "sub": bool}},
    "bad_lines": int}
   ```
 
@@ -904,6 +953,14 @@ class TestFold(unittest.TestCase):
         self.assertEqual(p["sessions"]["s1"]["last_ts"], "2026-09-22T02:00:00.000Z")
         self.assertEqual(p["sessions"]["s1"]["last_ctx"], 502)
 
+    def test_subagent_flag_marks_sessions(self):
+        p = agg.fold([usage("2026-09-22T01:00:00.000Z", input=1)], subagent=True)
+        self.assertTrue(p["sessions"]["s1"]["sub"])
+
+    def test_default_is_not_subagent(self):
+        p = agg.fold([usage("2026-09-22T01:00:00.000Z", input=1)])
+        self.assertFalse(p["sessions"]["s1"]["sub"])
+
     def test_title_event_names_session(self):
         p = agg.fold([{"kind": "title", "session": "s1", "title": "제목"}])
         self.assertEqual(p["sessions"]["s1"]["title"], "제목")
@@ -987,6 +1044,17 @@ class TestMerge(unittest.TestCase):
         self.assertEqual(s["sessions"]["s1"]["last_ts"], "2026-09-22T05:00:00.000Z")
         self.assertEqual(s["sessions"]["s1"]["last_ctx"], 901)
         self.assertEqual(s["totals"]["input"], 2)
+
+    def test_subagent_flag_survives_merge_and_tokens_still_count(self):
+        sub = agg.fold([usage("2026-09-22T01:00:00.000Z", session="a", input=7)],
+                       subagent=True)
+        main = agg.fold([usage("2026-09-22T01:00:00.000Z", session="b", input=3)])
+
+        s = agg.merge([sub, main])
+
+        self.assertTrue(s["sessions"]["a"]["sub"])
+        self.assertFalse(s["sessions"]["b"]["sub"])
+        self.assertEqual(s["totals"]["input"], 10)  # 총계에는 둘 다 들어간다
 
     def test_compact_stats(self):
         s = agg.merge([agg.fold([
@@ -1076,16 +1144,24 @@ def _day_bucket(partial, day):
 def _session(partial, sid):
     return partial["sessions"].setdefault(sid, {
         "title": None, "cwd": "", "model": "", "last_ts": "", "last_ctx": None,
+        "sub": False,
     })
 
 
-def fold(events, partial=None):
-    """이벤트들을 부분집계에 접어 넣는다. partial을 주면 그 위에 누적한다."""
+def fold(events, partial=None, subagent=False):
+    """이벤트들을 부분집계에 접어 넣는다. partial을 주면 그 위에 누적한다.
+
+    subagent=True는 서브에이전트 트랜스크립트에서 온 이벤트라는 뜻이다. 사용량
+    총계에는 들어가지만 실시간 세션 카드에서는 빠진다 — 사용자가 알고 싶은 것은
+    자기 세션이 언제 압축되는가이고, 서브에이전트 컨텍스트는 손쓸 대상이 아니다.
+    """
     p = empty_partial() if partial is None else partial
 
     for e in events:
         kind = e.get("kind")
         sid = e.get("session") or ""
+        if subagent and sid:
+            _session(p, sid)["sub"] = True
 
         if kind == "usage":
             day = local_day(e["ts"])
@@ -1136,6 +1212,8 @@ def _merge_sessions(target, incoming):
         # 제목은 한 번이라도 붙었으면 유지
         if s.get("title") and not cur.get("title"):
             cur["title"] = s["title"]
+        if s.get("sub"):
+            cur["sub"] = True  # 한 번이라도 서브에이전트면 서브에이전트다
         if s.get("last_ts", "") >= cur.get("last_ts", ""):
             cur["last_ts"] = s["last_ts"]
             if s.get("last_ctx") is not None:
@@ -1221,7 +1299,7 @@ cd ~/Workspaces/13_AgentPulse
 python3 -m unittest tests.test_aggregate -v
 ```
 
-Expected: PASS — 27 tests
+Expected: PASS — 31 tests
 
 - [ ] **Step 5: 커밋**
 
@@ -1422,6 +1500,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
   - `pulse.live.context_status(used: int | None, limit: int, caution: float, warn: float) -> str`
     반환: `"unknown" | "ok" | "caution" | "danger"`
   - `pulse.live.active_sessions(sessions: dict, cfg: dict, now: datetime | None = None) -> list[dict]`
+    `sub`가 참인 세션(서브에이전트 트랜스크립트)은 제외한다.
     반환 항목: `{"session": str, "title": str, "project": str, "model": str,
     "last_ts": str, "used": int | None, "limit": int, "ratio": float | None,
     "status": str}` — `ratio` 내림차순 정렬
@@ -1475,6 +1554,12 @@ class TestActiveSessions(unittest.TestCase):
         self.assertEqual(result[0]["project"], "11_Quant")
         self.assertEqual(result[0]["status"], "ok")
         self.assertAlmostEqual(result[0]["ratio"], 0.36)
+
+    def test_subagent_session_is_excluded(self):
+        sessions = {"s1": {"title": "서브", "cwd": "/x", "model": "m",
+                           "last_ts": iso(self.now - timedelta(minutes=1)),
+                           "last_ctx": 100, "sub": True}}
+        self.assertEqual(live.active_sessions(sessions, CFG, now=self.now), [])
 
     def test_old_session_is_excluded(self):
         sessions = {"s1": {"title": "옛날", "cwd": "/x", "model": "m",
@@ -1564,6 +1649,8 @@ def active_sessions(sessions, cfg, now=None):
 
     rows = []
     for sid, s in sessions.items():
+        if s.get("sub"):
+            continue  # 서브에이전트 세션 — 총계에는 있지만 카드에는 안 띄운다
         when = _parse(s.get("last_ts") or "")
         if when is None or when < cutoff:
             continue
@@ -1593,7 +1680,7 @@ cd ~/Workspaces/13_AgentPulse
 python3 -m unittest tests.test_live -v
 ```
 
-Expected: PASS — 11 tests
+Expected: PASS — 12 tests
 
 - [ ] **Step 5: 커밋**
 
@@ -1619,7 +1706,9 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 - Consumes: `scan.find_transcripts`, `scan.scan_file`, `aggregate.fold`, `aggregate.merge`, `cache.load_cache`, `cache.save_cache`
 - Produces:
   - `pulse.pipeline.refresh(projects_root, cache_path) -> tuple[list[dict], dict]`
-    반환 `(partials, cache)` — `partials`는 모든 파일의 부분집계 리스트
+    반환 `(partials, cache)` — `partials`는 모든 파일의 부분집계 리스트.
+    경로에 `/subagents/`가 들어간 파일은 `fold(..., subagent=True)`로 접는다.
+  - `pulse.pipeline.is_subagent(path: str) -> bool`
   - `pulse.pipeline.since_for(range_key: str, today: str | None = None) -> str | None`
     `"7d" -> 6일 전 날짜`, `"30d" -> 29일 전`, `"all" -> None`
 
@@ -1729,6 +1818,20 @@ class TestRefresh(unittest.TestCase):
         self.assertEqual(agg.merge(partials)["totals"]["input"], 10)
         self.assertEqual(len(cache["files"]), 1)
 
+    def test_subagent_transcripts_are_scanned_and_flagged(self):
+        sub_dir = self.proj / "sess" / "subagents"
+        sub_dir.mkdir(parents=True)
+        with open(sub_dir / "agent-x.jsonl", "w", encoding="utf-8") as f:
+            f.write(line(session="subsess", inp=4) + "\n")
+        self.write("a.jsonl", [line(session="mainsess", inp=6)])
+
+        partials, _ = pipeline.refresh(self.root / "projects", self.cache_path)
+        summary = agg.merge(partials)
+
+        self.assertEqual(summary["totals"]["input"], 10)  # 총계에 포함
+        self.assertTrue(summary["sessions"]["subsess"]["sub"])
+        self.assertFalse(summary["sessions"]["mainsess"]["sub"])
+
     def test_empty_root_gives_empty_summary(self):
         partials, cache = pipeline.refresh(self.root / "projects", self.cache_path)
         self.assertEqual(agg.merge(partials)["totals"]["total"], 0)
@@ -1762,6 +1865,11 @@ from pulse import cache as cache_mod
 from pulse import scan
 
 RANGES = {"7d": 7, "30d": 30}
+
+
+def is_subagent(path):
+    """서브에이전트 트랜스크립트는 <프로젝트>/<세션>/subagents/ 아래에 있다."""
+    return "/subagents/" in str(path)
 
 
 def since_for(range_key, today=None):
@@ -1801,7 +1909,7 @@ def refresh(projects_root, cache_path):
             partial = agg.empty_partial()
 
         events, new_offset, bad = scan.scan_file(path, offset)
-        partial = agg.fold(events, partial)
+        partial = agg.fold(events, partial, subagent=is_subagent(path))
         partial["bad_lines"] = partial.get("bad_lines", 0) + bad
 
         fresh[path] = {"size": st.st_size, "mtime": st.st_mtime,
@@ -1820,7 +1928,7 @@ cd ~/Workspaces/13_AgentPulse
 python3 -m unittest tests.test_pipeline -v
 ```
 
-Expected: PASS — 10 tests
+Expected: PASS — 11 tests
 
 - [ ] **Step 5: 실데이터로 증분 효과를 잰다**
 
