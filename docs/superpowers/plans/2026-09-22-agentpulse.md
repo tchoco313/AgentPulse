@@ -2132,12 +2132,15 @@ class TestApi(ServerTestCase):
         self.start()
         with self.assertRaises(urllib.error.HTTPError) as cm:
             self.get("/api/nope")
+        # HTTPError는 파일 객체다 — 닫지 않으면 ResourceWarning이 남는다
+        self.addCleanup(cm.exception.close)
         self.assertEqual(cm.exception.code, 404)
 
     def test_path_traversal_is_refused(self):
         self.start()
         with self.assertRaises(urllib.error.HTTPError) as cm:
             self.get("/../../etc/passwd")
+        self.addCleanup(cm.exception.close)
         self.assertIn(cm.exception.code, (400, 403, 404))
 
     def test_binds_loopback_only(self):
