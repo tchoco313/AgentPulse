@@ -145,6 +145,54 @@ class TestPortFallback(ServerTestCase):
             server.bind(self._state(), port=busy, web_dir=self.web, attempts=1)
 
 
+class TestConcurrency(ServerTestCase):
+    def test_simultaneous_summary_and_live_both_succeed(self):
+        """페이지가 뜰 때 두 요청이 동시에 나간다 — 실측으로 한쪽이 끊기던 경로."""
+        import threading
+
+        (self.projects / "a.jsonl").write_text(line() + "\n", encoding="utf-8")
+        self.start()
+        results = []
+
+        def hit(path):
+            try:
+                results.append(self.get(path)[0])
+            except Exception as e:  # noqa: BLE001
+                results.append(repr(e))
+
+        for _ in range(5):
+            ts = [threading.Thread(target=hit, args=(p,))
+                  for p in ("/api/summary?range=7d", "/api/live")]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+
+        self.assertEqual(results, [200] * 10)
+
+
+class TestApiErrorHandling(ServerTestCase):
+    def test_failure_inside_summary_returns_500_not_a_dropped_connection(self):
+        class Boom(server.State):
+            def summary(self, range_key):
+                raise RuntimeError("집계 실패")
+
+        state = Boom(cfg=CFG, projects_root=self.root / "projects",
+                     cache_path=self.root / "cache.json",
+                     claude_json=self.claude_json, skill_roots=[])
+        self.httpd = server.make_server(state, port=0, web_dir=self.web)
+        self.port = self.httpd.server_address[1]
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.addCleanup(self.httpd.server_close)
+        self.addCleanup(self.httpd.shutdown)
+
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            self.get("/api/summary?range=7d")
+        self.addCleanup(cm.exception.close)
+        self.assertEqual(cm.exception.code, 500)
+        self.assertEqual(json.loads(cm.exception.read())["error"], "RuntimeError")
+
+
 class TestEmptyEnvironment(ServerTestCase):
     def test_no_transcripts_still_serves(self):
         # Review Focus 4: 트랜스크립트가 하나도 없어도 정상으로 떠야 한다

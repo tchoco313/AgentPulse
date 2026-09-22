@@ -1,5 +1,7 @@
 """localhost 전용 HTTP 서버. 조립해서 JSON으로 낼 뿐 계산하지 않는다."""
 import json
+import threading
+import traceback
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -20,10 +22,18 @@ class State:
         self.cache_path = cache_path
         self.claude_json = claude_json or inventory.DEFAULT_CLAUDE_JSON
         self.skill_roots = skill_roots
+        self._lock = threading.Lock()
 
     def _partials(self):
-        partials, _ = pipeline.refresh(self.projects_root, self.cache_path)
-        return partials
+        """갱신은 한 번에 하나만 돈다.
+
+        페이지가 뜰 때 /api/summary와 /api/live가 동시에 나가는데, 둘 다 같은
+        캐시 파일을 갱신한다. 직렬화하지 않으면 두 스레드가 같은 캐시를 두고
+        경쟁한다 — 실측으로 로드마다 한쪽 요청이 끊겼다.
+        """
+        with self._lock:
+            partials, _ = pipeline.refresh(self.projects_root, self.cache_path)
+            return partials
 
     def summary(self, range_key):
         since = pipeline.since_for(range_key)
@@ -70,18 +80,22 @@ def _handler_class(state, web_dir):
             parsed = urlparse(self.path)
             route = parsed.path
 
-            if route == "/api/summary":
-                q = parse_qs(parsed.query)
-                range_key = (q.get("range") or ["7d"])[0]
-                if range_key not in ("7d", "30d", "all"):
-                    range_key = "7d"
-                return self._json(state.summary(range_key))
-
-            if route == "/api/live":
-                return self._json(state.live())
-
             if route.startswith("/api/"):
-                return self._json({"error": "not found"}, status=404)
+                # 집계 중 예외가 나도 연결을 끊지 않는다 — 끊기면 브라우저에는
+                # 원인 없는 실패로만 보이고, 5초마다 조용히 반복된다.
+                try:
+                    if route == "/api/summary":
+                        q = parse_qs(parsed.query)
+                        range_key = (q.get("range") or ["7d"])[0]
+                        if range_key not in ("7d", "30d", "all"):
+                            range_key = "7d"
+                        return self._json(state.summary(range_key))
+                    if route == "/api/live":
+                        return self._json(state.live())
+                    return self._json({"error": "not found"}, status=404)
+                except Exception as e:  # noqa: BLE001 - 대시보드를 죽이지 않는다
+                    traceback.print_exc()
+                    return self._json({"error": type(e).__name__}, status=500)
 
             return super().do_GET()
 
