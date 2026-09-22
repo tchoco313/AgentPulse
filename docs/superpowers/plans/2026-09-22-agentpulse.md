@@ -3007,9 +3007,16 @@ class TestMessage(unittest.TestCase):
 
 class TestScriptNeverFails(unittest.TestCase):
     def run_script(self, stdin_text, alerted_path, cwd=None):
+        """설정 경로도 주입한다 — 안 그러면 실제 ~/.claude를 읽는다."""
+        d = Path(tempfile.mkdtemp())
+        settings = d / "settings.json"
+        settings.write_text(json.dumps({"model": "opus[1m]"}), encoding="utf-8")
         return subprocess.run(
             [sys.executable, str(ROOT / "hooks" / "context_alert.py"),
-             "--alerted-path", str(alerted_path), "--dry-run"],
+             "--alerted-path", str(alerted_path),
+             "--config-path", str(d / "absent.json"),
+             "--settings-path", str(settings),
+             "--dry-run"],
             input=stdin_text, text=True, capture_output=True,
             cwd=cwd or ROOT,
         )
@@ -3047,6 +3054,13 @@ class TestScriptNeverFails(unittest.TestCase):
         r = self.run_script(json.dumps(payload(pct=99.0)),
                             "/nonexistent-root/alerted.json")
         self.assertEqual(r.returncode, 0)
+
+    def test_unwritable_alerted_path_does_not_alert_every_turn(self):
+        """기록이 안 되면 조용히 넘어간다. 턴마다 울리는 알림이 더 나쁘다."""
+        outs = [self.run_script(json.dumps(payload(pct=99.0)),
+                                "/nonexistent-root/alerted.json").stdout
+                for _ in range(3)]
+        self.assertEqual(outs, ["", "", ""])
 
 
 if __name__ == "__main__":
@@ -3136,6 +3150,9 @@ def _notify(title, body):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--alerted-path", default=str(DEFAULT_ALERTED_PATH))
+    # 설정 경로도 주입할 수 있어야 테스트가 실제 ~/.claude를 읽지 않는다.
+    ap.add_argument("--config-path", default=None)
+    ap.add_argument("--settings-path", default=None)
     ap.add_argument("--dry-run", action="store_true",
                     help="알림을 띄우는 대신 표준출력에 찍는다 (테스트용)")
     args = ap.parse_args()
@@ -3143,7 +3160,8 @@ def main():
     from pulse import config
 
     payload = json.loads(sys.stdin.read())
-    cfg = config.load_config()
+    cfg = config.load_config(config_path=args.config_path,
+                             settings_path=args.settings_path)
 
     alerted_path = Path(args.alerted_path)
     try:
@@ -3157,21 +3175,26 @@ def main():
     if not fire:
         return
 
+    # 기록이 먼저다. 알린 뒤에 기록하면, 기록이 계속 실패할 때(디스크 가득,
+    # 권한) 매 턴 알림이 다시 뜬다. 턴마다 울리는 알림은 한 번도 안 울리는
+    # 것보다 나쁘다 — 사용자는 그냥 알림을 꺼버린다.
+    alerted_path.parent.mkdir(parents=True, exist_ok=True)
+    alerted_path.write_text(json.dumps(seen), encoding="utf-8")
+
     title, body = message(payload, cfg)
     if args.dry_run:
         print(f"{title}: {body}")
     else:
         _notify(title, body)
 
-    alerted_path.parent.mkdir(parents=True, exist_ok=True)
-    alerted_path.write_text(json.dumps(seen), encoding="utf-8")
-
 
 if __name__ == "__main__":
     try:
         main()
-    except Exception:
-        pass  # 훅은 Claude Code를 절대 막지 않는다
+    except BaseException:
+        # Exception만 잡으면 argparse의 SystemExit이 새어나가 종료코드가 2가 된다.
+        # 훅은 무슨 일이 있어도 Claude Code를 막지 않는다.
+        pass
     sys.exit(0)
 ```
 
@@ -3184,7 +3207,7 @@ cd ~/Workspaces/13_AgentPulse
 python3 -m unittest tests.test_context_alert -v
 ```
 
-Expected: PASS — 14 tests
+Expected: PASS — 15 tests
 
 - [ ] **Step 5: 알림이 실제로 뜨는지 눈으로 확인한다**
 
