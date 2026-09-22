@@ -83,6 +83,16 @@ class TestActiveSessions(unittest.TestCase):
         result = live.active_sessions(sessions, CFG, now=self.now)
         self.assertEqual([r["session"] for r in result], ["high", "low"])
 
+    def test_naive_now_does_not_raise(self):
+        sessions = {"s1": {"title": "작업", "cwd": "/x", "model": "m",
+                           "last_ts": iso(self.now - timedelta(minutes=1)),
+                           "last_ctx": 100, "sub": False}}
+
+        result = live.active_sessions(sessions, CFG,
+                                      now=self.now.replace(tzinfo=None))
+
+        self.assertEqual(len(result), 1)
+
     def test_unparseable_timestamp_is_excluded(self):
         sessions = {"s1": {"title": "x", "cwd": "/x", "model": "m",
                            "last_ts": "not-a-date", "last_ctx": 1}}

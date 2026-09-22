@@ -23,6 +23,10 @@ def _parse(ts):
 
 def active_sessions(sessions, cfg, now=None):
     now = datetime.now(timezone.utc) if now is None else now
+    if now.tzinfo is None:
+        # 순진한 datetime을 받아도 죽지 않는다 — last_ts는 항상 tz를 달고 오므로
+        # 그대로 비교하면 TypeError가 나고, 5초마다 도는 페이지가 멈춘다
+        now = now.replace(tzinfo=timezone.utc)
     cutoff = now - timedelta(minutes=cfg["active_window_minutes"])
     limit = cfg["context_limit"]
 
