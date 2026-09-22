@@ -300,6 +300,32 @@ class TestCache(unittest.TestCase):
         cache.save_cache(self.path, cache.empty_cache())
         self.assertEqual([p.name for p in self.dir.iterdir()], ["pulse-cache.json"])
 
+    def test_concurrent_saves_all_succeed(self):
+        """두 요청이 동시에 갱신해도 죽지 않는다 — 실측으로 터지던 경로다."""
+        import threading
+
+        errors = []
+
+        def writer(i):
+            data = cache.empty_cache()
+            data["files"][f"/f{i}.jsonl"] = {"size": i, "mtime": 1.0,
+                                             "offset": i, "partial": {}}
+            try:
+                for _ in range(20):
+                    cache.save_cache(self.path, data)
+            except Exception as e:  # noqa: BLE001 - 무엇이 터지든 기록한다
+                errors.append(repr(e))
+
+        threads = [threading.Thread(target=writer, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(errors, [])
+        self.assertEqual([p.name for p in self.dir.iterdir()], ["pulse-cache.json"])
+        self.assertEqual(cache.load_cache(self.path)["schema"], cache.SCHEMA_VERSION)
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -322,6 +348,7 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'pulse.cache'`
 """파일별 부분집계 캐시의 입출력."""
 import json
 import os
+import tempfile
 from pathlib import Path
 
 SCHEMA_VERSION = 1
@@ -347,13 +374,25 @@ def load_cache(path):
 
 
 def save_cache(path, cache):
-    """임시 파일에 쓰고 rename — 쓰는 중에 죽어도 반쪽 캐시가 남지 않는다."""
+    """임시 파일에 쓰고 rename — 쓰는 중에 죽어도 반쪽 캐시가 남지 않는다.
+
+    임시 파일 이름은 호출마다 고유해야 한다. 고정 이름을 쓰면 두 스레드가 같은
+    tmp를 쓰다가 한쪽이 os.replace로 치운 뒤 다른 쪽이 FileNotFoundError로
+    죽는다(실측: 페이지 로드마다 두 요청 중 하나가 끊겼다).
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(cache, f)
-    os.replace(tmp, path)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(cache, f)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 ```
 
 - [ ] **Step 4: 통과를 확인한다**
@@ -363,7 +402,7 @@ cd ~/Workspaces/13_AgentPulse
 python3 -m unittest tests.test_cache -v
 ```
 
-Expected: PASS — 6 tests
+Expected: PASS — 7 tests
 
 - [ ] **Step 5: 커밋**
 
@@ -2229,6 +2268,54 @@ class TestPortFallback(ServerTestCase):
             server.bind(self._state(), port=busy, web_dir=self.web, attempts=1)
 
 
+class TestConcurrency(ServerTestCase):
+    def test_simultaneous_summary_and_live_both_succeed(self):
+        """페이지가 뜰 때 두 요청이 동시에 나간다 — 실측으로 한쪽이 끊기던 경로."""
+        import threading
+
+        (self.projects / "a.jsonl").write_text(line() + "\n", encoding="utf-8")
+        self.start()
+        results = []
+
+        def hit(path):
+            try:
+                results.append(self.get(path)[0])
+            except Exception as e:  # noqa: BLE001
+                results.append(repr(e))
+
+        for _ in range(5):
+            ts = [threading.Thread(target=hit, args=(p,))
+                  for p in ("/api/summary?range=7d", "/api/live")]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+
+        self.assertEqual(results, [200] * 10)
+
+
+class TestApiErrorHandling(ServerTestCase):
+    def test_failure_inside_summary_returns_500_not_a_dropped_connection(self):
+        class Boom(server.State):
+            def summary(self, range_key):
+                raise RuntimeError("집계 실패")
+
+        state = Boom(cfg=CFG, projects_root=self.root / "projects",
+                     cache_path=self.root / "cache.json",
+                     claude_json=self.claude_json, skill_roots=[])
+        self.httpd = server.make_server(state, port=0, web_dir=self.web)
+        self.port = self.httpd.server_address[1]
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.addCleanup(self.httpd.server_close)
+        self.addCleanup(self.httpd.shutdown)
+
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            self.get("/api/summary?range=7d")
+        self.addCleanup(cm.exception.close)
+        self.assertEqual(cm.exception.code, 500)
+        self.assertEqual(json.loads(cm.exception.read())["error"], "RuntimeError")
+
+
 class TestEmptyEnvironment(ServerTestCase):
     def test_no_transcripts_still_serves(self):
         # Review Focus 4: 트랜스크립트가 하나도 없어도 정상으로 떠야 한다
@@ -2266,7 +2353,9 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'pulse.server'`
 
 ```python
 """localhost 전용 HTTP 서버. 조립해서 JSON으로 낼 뿐 계산하지 않는다."""
+import traceback
 import json
+import threading
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -2287,10 +2376,18 @@ class State:
         self.cache_path = cache_path
         self.claude_json = claude_json or inventory.DEFAULT_CLAUDE_JSON
         self.skill_roots = skill_roots
+        self._lock = threading.Lock()
 
     def _partials(self):
-        partials, _ = pipeline.refresh(self.projects_root, self.cache_path)
-        return partials
+        """갱신은 한 번에 하나만 돈다.
+
+        페이지가 뜰 때 /api/summary와 /api/live가 동시에 나가는데, 둘 다 같은
+        캐시 파일을 갱신한다. 직렬화하지 않으면 두 스레드가 같은 캐시를 두고
+        경쟁한다 — 실측으로 로드마다 한쪽 요청이 끊겼다.
+        """
+        with self._lock:
+            partials, _ = pipeline.refresh(self.projects_root, self.cache_path)
+            return partials
 
     def summary(self, range_key):
         since = pipeline.since_for(range_key)
@@ -2337,18 +2434,22 @@ def _handler_class(state, web_dir):
             parsed = urlparse(self.path)
             route = parsed.path
 
-            if route == "/api/summary":
-                q = parse_qs(parsed.query)
-                range_key = (q.get("range") or ["7d"])[0]
-                if range_key not in ("7d", "30d", "all"):
-                    range_key = "7d"
-                return self._json(state.summary(range_key))
-
-            if route == "/api/live":
-                return self._json(state.live())
-
             if route.startswith("/api/"):
-                return self._json({"error": "not found"}, status=404)
+                # 집계 중 예외가 나도 연결을 끊지 않는다 — 끊기면 브라우저에는
+                # 원인 없는 실패로만 보이고, 5초마다 조용히 반복된다.
+                try:
+                    if route == "/api/summary":
+                        q = parse_qs(parsed.query)
+                        range_key = (q.get("range") or ["7d"])[0]
+                        if range_key not in ("7d", "30d", "all"):
+                            range_key = "7d"
+                        return self._json(state.summary(range_key))
+                    if route == "/api/live":
+                        return self._json(state.live())
+                    return self._json({"error": "not found"}, status=404)
+                except Exception as e:  # noqa: BLE001 - 대시보드를 죽이지 않는다
+                    traceback.print_exc()
+                    return self._json({"error": type(e).__name__}, status=500)
 
             return super().do_GET()
 
@@ -2444,7 +2545,7 @@ cd ~/Workspaces/13_AgentPulse
 python3 -m unittest tests.test_server -v
 ```
 
-Expected: PASS — 13 tests
+Expected: PASS — 15 tests
 
 - [ ] **Step 5: 전체 테스트를 돌린다**
 
