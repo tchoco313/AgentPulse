@@ -300,6 +300,32 @@ class TestCache(unittest.TestCase):
         cache.save_cache(self.path, cache.empty_cache())
         self.assertEqual([p.name for p in self.dir.iterdir()], ["pulse-cache.json"])
 
+    def test_concurrent_saves_all_succeed(self):
+        """두 요청이 동시에 갱신해도 죽지 않는다 — 실측으로 터지던 경로다."""
+        import threading
+
+        errors = []
+
+        def writer(i):
+            data = cache.empty_cache()
+            data["files"][f"/f{i}.jsonl"] = {"size": i, "mtime": 1.0,
+                                             "offset": i, "partial": {}}
+            try:
+                for _ in range(20):
+                    cache.save_cache(self.path, data)
+            except Exception as e:  # noqa: BLE001 - 무엇이 터지든 기록한다
+                errors.append(repr(e))
+
+        threads = [threading.Thread(target=writer, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(errors, [])
+        self.assertEqual([p.name for p in self.dir.iterdir()], ["pulse-cache.json"])
+        self.assertEqual(cache.load_cache(self.path)["schema"], cache.SCHEMA_VERSION)
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -322,6 +348,7 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'pulse.cache'`
 """파일별 부분집계 캐시의 입출력."""
 import json
 import os
+import tempfile
 from pathlib import Path
 
 SCHEMA_VERSION = 1
@@ -347,13 +374,25 @@ def load_cache(path):
 
 
 def save_cache(path, cache):
-    """임시 파일에 쓰고 rename — 쓰는 중에 죽어도 반쪽 캐시가 남지 않는다."""
+    """임시 파일에 쓰고 rename — 쓰는 중에 죽어도 반쪽 캐시가 남지 않는다.
+
+    임시 파일 이름은 호출마다 고유해야 한다. 고정 이름을 쓰면 두 스레드가 같은
+    tmp를 쓰다가 한쪽이 os.replace로 치운 뒤 다른 쪽이 FileNotFoundError로
+    죽는다(실측: 페이지 로드마다 두 요청 중 하나가 끊겼다).
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(cache, f)
-    os.replace(tmp, path)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(cache, f)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 ```
 
 - [ ] **Step 4: 통과를 확인한다**
@@ -363,7 +402,7 @@ cd ~/Workspaces/13_AgentPulse
 python3 -m unittest tests.test_cache -v
 ```
 
-Expected: PASS — 6 tests
+Expected: PASS — 7 tests
 
 - [ ] **Step 5: 커밋**
 
@@ -386,21 +425,33 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 **Interfaces:**
 - Consumes: 없음
 - Produces:
-  - `pulse.scan.parse_line(line: str) -> dict | None` — 관심 없는 줄과 깨진 줄은 `None`
+  - `pulse.scan.MALFORMED` — 파싱 실패를 뜻하는 센티널 객체
+  - `pulse.scan.parse_line(line: str) -> list[dict] | None | MALFORMED`
+    관심 없는 레코드는 `None`, JSON 파싱 실패는 `MALFORMED`.
+    **둘을 반드시 구분한다** — JSONL은 모든 줄이 `{`로 시작하므로 `scan_file`이
+    문자열 모양으로 깨진 줄을 알아낼 방법이 없다. 섞으면 attachment·mode 같은
+    평범한 레코드가 전부 "읽지 못한 줄"로 집계된다(실측: 한 파일에서 0건이 52건으로).
   - `pulse.scan.scan_file(path, offset: int = 0) -> tuple[list[dict], int, int]`
     반환: `(events, new_offset, bad_lines)`
-  - `pulse.scan.find_transcripts(root) -> list[str]` — 정렬된 절대경로
+  - `pulse.scan.find_transcripts(root) -> list[str]` — 정렬된 절대경로.
+    루트 아래 **모든** `.jsonl`을 재귀로 찾는다. 서브에이전트 트랜스크립트가
+    `<프로젝트>/<세션>/subagents/agent-*.jsonl`에 있고, 실측 117개 중 53개가
+    거기 있다 — 2단계만 훑으면 토큰·호출 총계의 45%가 빠진다.
 
   **정규화 이벤트 형태** (뒤 태스크가 전부 이 형태에 의존한다):
 
   ```python
   {"kind": "usage", "ts": str, "session": str, "cwd": str, "model": str,
-   "input": int, "output": int, "cache_read": int, "cache_creation": int}
-  {"kind": "tool", "ts": str, "session": str, "name": str, "skill": str | None}
+   "input": int, "output": int, "cache_read": int, "cache_creation": int, "sub": bool}
+  {"kind": "tool", "ts": str, "session": str, "name": str, "skill": str | None, "sub": bool}
   {"kind": "compact", "ts": str, "session": str, "trigger": str, "pre": int, "post": int}
   {"kind": "title", "session": str, "title": str}
-  {"kind": "activity", "ts": str, "session": str}
+  {"kind": "activity", "ts": str, "session": str, "sub": bool}
   ```
+
+  `sub`는 그 레코드의 `isSidechain`이다. 서브에이전트 트랜스크립트는 **부모와 같은
+  `sessionId`를 쓰므로**, 세션을 구분하는 유일한 신호가 이 필드다. 파일 경로로
+  판단하면 부모 세션까지 서브에이전트로 물들어 실시간 카드에서 사라진다(실측).
 
   `ts`는 트랜스크립트 원문 그대로의 ISO 문자열(예: `"2026-09-22T01:37:49.879Z"`)이다.
 
@@ -418,7 +469,8 @@ from pulse import scan
 
 
 def assistant_line(ts="2026-09-22T01:00:00.000Z", session="s1", usage=None,
-                   model="claude-opus-5", tools=(), cwd="/Users/teo"):
+                   model="claude-opus-5", tools=(), cwd="/Users/teo",
+                   sidechain=False):
     content = [{"type": "text", "text": "hi"}]
     for name, inp in tools:
         content.append({"type": "tool_use", "id": "t", "name": name, "input": inp})
@@ -427,7 +479,7 @@ def assistant_line(ts="2026-09-22T01:00:00.000Z", session="s1", usage=None,
         msg["usage"] = usage
     return json.dumps({
         "type": "assistant", "timestamp": ts, "sessionId": session,
-        "cwd": cwd, "message": msg,
+        "cwd": cwd, "isSidechain": sidechain, "message": msg,
     })
 
 
@@ -465,6 +517,17 @@ class TestParseLine(unittest.TestCase):
         self.assertIsNone(tools[0]["skill"])
         self.assertEqual(tools[1]["skill"], "dataviz")
 
+    def test_sidechain_records_are_marked(self):
+        # 서브에이전트 트랜스크립트는 부모와 같은 sessionId를 쓴다.
+        # isSidechain만이 둘을 가르는 신호다.
+        ev = scan.parse_line(assistant_line(usage={}, sidechain=True,
+                                            tools=[("Bash", {})]))
+        self.assertTrue(all(e["sub"] for e in ev))
+
+    def test_non_sidechain_records_are_not_marked(self):
+        ev = scan.parse_line(assistant_line(usage={}, tools=[("Bash", {})]))
+        self.assertFalse(any(e["sub"] for e in ev))
+
     def test_compact_boundary(self):
         line = json.dumps({
             "type": "system", "subtype": "compact_boundary",
@@ -491,11 +554,19 @@ class TestParseLine(unittest.TestCase):
         events = scan.parse_line(line)
         self.assertEqual(events[0]["kind"], "activity")
 
-    def test_broken_json_returns_none(self):
-        self.assertIsNone(scan.parse_line("{not json"))
+    def test_broken_json_returns_malformed(self):
+        self.assertIs(scan.parse_line("{not json"), scan.MALFORMED)
+
+    def test_non_object_json_is_malformed(self):
+        self.assertIs(scan.parse_line("[1, 2, 3]"), scan.MALFORMED)
 
     def test_uninteresting_line_returns_none(self):
         self.assertIsNone(scan.parse_line(json.dumps({"type": "mode", "mode": "x"})))
+
+    def test_uninteresting_lines_are_not_counted_as_bad(self):
+        # JSONL은 모든 줄이 '{'로 시작한다 — 모양으로 구분하면 전부 깨진 줄이 된다
+        self.assertIsNone(scan.parse_line(json.dumps({"type": "attachment"})))
+        self.assertIsNone(scan.parse_line(json.dumps({"type": "last-prompt"})))
 
 
 class TestScanFile(unittest.TestCase):
@@ -522,6 +593,16 @@ class TestScanFile(unittest.TestCase):
         events, _, bad = scan.scan_file(self.path, 0)
         self.assertEqual(len([e for e in events if e["kind"] == "usage"]), 2)
         self.assertEqual(bad, 1)
+
+    def test_routine_records_are_not_counted_as_bad(self):
+        # 실제 코퍼스의 첫 파일: 파싱 실패 0건인데 52건으로 세던 회귀
+        self.write([json.dumps({"type": "attachment", "sessionId": "s1"}),
+                    json.dumps({"type": "mode", "mode": "x"}),
+                    json.dumps({"type": "last-prompt", "lastPrompt": "x"}),
+                    assistant_line(usage={"input_tokens": 1})])
+        events, _, bad = scan.scan_file(self.path, 0)
+        self.assertEqual(bad, 0)
+        self.assertEqual(len([e for e in events if e["kind"] == "usage"]), 1)
 
     def test_incremental_reads_only_new_lines(self):
         self.write([assistant_line(usage={"input_tokens": 1})])
@@ -580,6 +661,21 @@ class TestFindTranscripts(unittest.TestCase):
 
         self.assertEqual([Path(p).name for p in found], ["a.jsonl", "b.jsonl"])
 
+    def test_finds_subagent_transcripts(self):
+        # 실측 117개 중 53개가 <프로젝트>/<세션>/subagents/ 아래에 있다
+        root = Path(tempfile.mkdtemp())
+        (root / "proj" / "sess" / "subagents").mkdir(parents=True)
+        (root / "proj" / "main.jsonl").write_text("", encoding="utf-8")
+        (root / "proj" / "sess" / "subagents" / "agent-x.jsonl").write_text(
+            "", encoding="utf-8")
+
+        found = scan.find_transcripts(root)
+
+        # 전체 경로로 정렬하므로 proj/main.jsonl 이
+        # proj/sess/subagents/agent-x.jsonl 보다 앞선다
+        self.assertEqual([Path(p).name for p in found],
+                         ["main.jsonl", "agent-x.jsonl"])
+
     def test_missing_root_gives_empty_list(self):
         self.assertEqual(scan.find_transcripts("/nonexistent/projects"), [])
 
@@ -610,12 +706,20 @@ import json
 from pathlib import Path
 
 
+MALFORMED = object()
+"""파싱 실패를 뜻하는 센티널. '관심 없는 줄'(None)과 구분하기 위해 필요하다."""
+
+
 def find_transcripts(root):
-    """<root>/<project>/<session>.jsonl 들을 정렬해 돌려준다."""
+    """루트 아래 모든 .jsonl을 정렬해 돌려준다.
+
+    서브에이전트 트랜스크립트가 <프로젝트>/<세션>/subagents/ 아래에 있어서
+    2단계 glob으로는 절반 가까이를 놓친다.
+    """
     root = Path(root)
     if not root.is_dir():
         return []
-    return sorted(str(p) for p in root.glob("*/*.jsonl"))
+    return sorted(str(p) for p in root.rglob("*.jsonl"))
 
 
 def _int(d, key):
@@ -624,17 +728,19 @@ def _int(d, key):
 
 
 def parse_line(line):
-    """한 줄 -> 이벤트 리스트. 관심 없거나 깨진 줄은 None."""
+    """한 줄 -> 이벤트 리스트. 관심 없으면 None, 파싱 실패면 MALFORMED."""
     try:
         d = json.loads(line)
     except ValueError:
-        return None
+        return MALFORMED
     if not isinstance(d, dict):
-        return None
+        return MALFORMED
 
     kind = d.get("type")
     session = d.get("sessionId") or ""
     ts = d.get("timestamp") or ""
+
+    sub = bool(d.get("isSidechain"))
 
     if kind == "assistant":
         msg = d.get("message") or {}
@@ -646,6 +752,7 @@ def parse_line(line):
             "output": _int(usage, "output_tokens"),
             "cache_read": _int(usage, "cache_read_input_tokens"),
             "cache_creation": _int(usage, "cache_creation_input_tokens"),
+            "sub": sub,
         }]
         for block in msg.get("content") or []:
             if isinstance(block, dict) and block.get("type") == "tool_use":
@@ -655,6 +762,7 @@ def parse_line(line):
                     "kind": "tool", "ts": ts, "session": session,
                     "name": block.get("name") or "",
                     "skill": skill if isinstance(skill, str) else None,
+                    "sub": sub,
                 })
         return events
 
@@ -671,7 +779,7 @@ def parse_line(line):
                  "title": d.get("aiTitle") or ""}]
 
     if kind == "user":
-        return [{"kind": "activity", "ts": ts, "session": session}]
+        return [{"kind": "activity", "ts": ts, "session": session, "sub": sub}]
 
     return None
 
@@ -696,9 +804,10 @@ def scan_file(path, offset=0):
                 if not text:
                     continue
                 parsed = parse_line(text)
+                if parsed is MALFORMED:
+                    bad += 1
+                    continue
                 if parsed is None:
-                    if text.startswith("{"):
-                        bad += 1
                     continue
                 events.extend(parsed)
     except OSError:
@@ -714,7 +823,7 @@ cd ~/Workspaces/13_AgentPulse
 python3 -m unittest tests.test_scan -v
 ```
 
-Expected: PASS — 16 tests
+Expected: PASS — 22 tests
 
 - [ ] **Step 5: 실제 데이터로 한 번 돌려본다**
 
@@ -757,7 +866,11 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
     반환 `(group, label)`, group은 `"mcp" | "skill" | "tools"` 중 하나
   - `pulse.aggregate.local_day(ts: str) -> str` — `"YYYY-MM-DD"`, 로컬 타임존 기준
   - `pulse.aggregate.empty_partial() -> dict`
-  - `pulse.aggregate.fold(events: list[dict], partial: dict | None = None) -> dict`
+  - `pulse.aggregate.fold(events, partial=None) -> dict`
+    `sub`가 참인 이벤트의 토큰·호출은 일별 집계에 **들어가지만**, 세션의
+    `last_ts`/`last_ctx`는 갱신하지 않는다. 서브에이전트는 부모와 세션 id를
+    공유하므로, 갱신하면 실시간 카드가 서브에이전트의 컨텍스트를 사용자 것으로
+    표시한다(실측 432,769 — 사용자 실제값이 아니었다).
   - `pulse.aggregate.merge(partials: list[dict], since: str | None = None) -> dict`
 
   **partial 형태:**
@@ -765,8 +878,10 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
   ```python
   {"days": {"2026-09-22": {"input": int, "output": int, "cache_read": int,
                             "cache_creation": int,
-                            "calls": {"mcp": int, "skill": int, "tools": int}}},
-   "tools": {"mcp": {"dbhub": int}, "skill": {"dataviz": int}, "tools": {"Bash": int}},
+                            "calls": {"mcp": int, "skill": int, "tools": int},
+                            "labels": {"mcp": {"dbhub": int},
+                                       "skill": {"dataviz": int},
+                                       "tools": {"Bash": int}}}},
    "compacts": [{"ts": str, "day": str, "trigger": str, "pre": int, "post": int,
                  "dropped": int}],
    "sessions": {"<sid>": {"title": str | None, "cwd": str, "model": str,
@@ -804,13 +919,14 @@ from pulse import aggregate as agg
 def usage(ts, session="s1", **kw):
     e = {"kind": "usage", "ts": ts, "session": session, "cwd": "/Users/teo",
          "model": "claude-opus-5", "input": 0, "output": 0,
-         "cache_read": 0, "cache_creation": 0}
+         "cache_read": 0, "cache_creation": 0, "sub": False}
     e.update(kw)
     return e
 
 
-def tool(ts, name, skill=None, session="s1"):
-    return {"kind": "tool", "ts": ts, "session": session, "name": name, "skill": skill}
+def tool(ts, name, skill=None, session="s1", sub=False):
+    return {"kind": "tool", "ts": ts, "session": session, "name": name,
+            "skill": skill, "sub": sub}
 
 
 class TestClassifyTool(unittest.TestCase):
@@ -868,10 +984,11 @@ class TestFold(unittest.TestCase):
                       tool("2026-09-22T01:00:00.000Z", "Bash"),
                       tool("2026-09-22T01:00:00.000Z", "mcp__dbhub__execute_sql"),
                       tool("2026-09-22T01:00:00.000Z", "Skill", skill="dataviz")])
-        self.assertEqual(p["tools"]["tools"]["Bash"], 2)
-        self.assertEqual(p["tools"]["mcp"]["dbhub"], 1)
-        self.assertEqual(p["tools"]["skill"]["dataviz"], 1)
         day = agg.local_day("2026-09-22T01:00:00.000Z")
+        labels = p["days"][day]["labels"]
+        self.assertEqual(labels["tools"]["Bash"], 2)
+        self.assertEqual(labels["mcp"]["dbhub"], 1)
+        self.assertEqual(labels["skill"]["dataviz"], 1)
         self.assertEqual(p["days"][day]["calls"],
                          {"mcp": 1, "skill": 1, "tools": 2})
 
@@ -904,6 +1021,33 @@ class TestFold(unittest.TestCase):
         self.assertEqual(p["sessions"]["s1"]["last_ts"], "2026-09-22T02:00:00.000Z")
         self.assertEqual(p["sessions"]["s1"]["last_ctx"], 502)
 
+    def test_sidechain_tokens_count_but_do_not_move_session_state(self):
+        # 서브에이전트는 부모와 같은 sessionId를 쓴다. 토큰은 사용자가 쓴 것이
+        # 맞지만, 컨텍스트 점유는 부모 것이 아니다.
+        p = agg.fold([
+            usage("2026-09-22T01:00:00.000Z", input=1, cache_read=100),
+            usage("2026-09-22T02:00:00.000Z", input=5, cache_read=900, sub=True),
+        ])
+        day = agg.local_day("2026-09-22T01:00:00.000Z")
+        self.assertEqual(p["days"][day]["input"], 6)          # 토큰은 다 센다
+        self.assertEqual(p["sessions"]["s1"]["last_ctx"], 101)  # 사용자 값 유지
+        self.assertEqual(p["sessions"]["s1"]["last_ts"],
+                         "2026-09-22T01:00:00.000Z")
+
+    def test_sidechain_activity_does_not_move_last_ts(self):
+        p = agg.fold([
+            usage("2026-09-22T01:00:00.000Z", input=1),
+            {"kind": "activity", "ts": "2026-09-22T05:00:00.000Z",
+             "session": "s1", "sub": True},
+        ])
+        self.assertEqual(p["sessions"]["s1"]["last_ts"],
+                         "2026-09-22T01:00:00.000Z")
+
+    def test_sidechain_tool_calls_count_in_ranking(self):
+        p = agg.fold([tool("2026-09-22T01:00:00.000Z", "Bash", sub=True)])
+        day = agg.local_day("2026-09-22T01:00:00.000Z")
+        self.assertEqual(p["days"][day]["labels"]["tools"]["Bash"], 1)
+
     def test_title_event_names_session(self):
         p = agg.fold([{"kind": "title", "session": "s1", "title": "제목"}])
         self.assertEqual(p["sessions"]["s1"]["title"], "제목")
@@ -924,18 +1068,26 @@ class TestFold(unittest.TestCase):
 
 class TestMerge(unittest.TestCase):
     def test_incremental_equals_whole(self):
-        """증분 경로와 전체 경로가 같은 답을 낸다 — 증분 스캔이 옳다는 근거."""
+        """증분 경로와 전체 경로가 같은 답을 낸다 — 증분 스캔이 옳다는 근거.
+
+        서브에이전트 이벤트를 섞어둔다. 세션 상태를 건너뛰는 분기가 생겼으니,
+        그 분기가 쪼개는 지점에 따라 달라지지 않는지도 여기서 걸린다.
+        """
         events = [
             usage("2026-09-20T01:00:00.000Z", input=10, output=1),
             tool("2026-09-20T01:00:00.000Z", "Bash"),
+            usage("2026-09-20T03:00:00.000Z", input=7, cache_read=70, sub=True),
+            tool("2026-09-20T03:00:00.000Z", "Read", sub=True),
             usage("2026-09-21T01:00:00.000Z", input=20, cache_read=5),
             tool("2026-09-21T01:00:00.000Z", "mcp__dbhub__execute_sql"),
+            {"kind": "activity", "ts": "2026-09-21T04:00:00.000Z",
+             "session": "s1", "sub": True},
             {"kind": "compact", "ts": "2026-09-21T02:00:00.000Z", "session": "s1",
              "trigger": "auto", "pre": 900, "post": 100},
         ]
         whole = agg.merge([agg.fold(events)])
 
-        incremental = agg.merge([agg.fold(events[:2]), agg.fold(events[2:])])
+        incremental = agg.merge([agg.fold(events[:3]), agg.fold(events[3:])])
 
         self.assertEqual(whole, incremental)
 
@@ -967,6 +1119,29 @@ class TestMerge(unittest.TestCase):
         self.assertEqual(s["totals"]["input"], 7)
         self.assertNotIn(d20, [d["day"] for d in s["days"]])
 
+    def test_since_filters_tool_ranking_too(self):
+        """기간 탭을 바꿨는데 순위만 전체 기간이면 조용히 틀린 숫자가 된다."""
+        d22 = agg.local_day("2026-09-22T01:00:00.000Z")
+        p = agg.fold([tool("2026-09-20T01:00:00.000Z", "OldTool"),
+                      tool("2026-09-22T01:00:00.000Z", "NewTool")])
+
+        s = agg.merge([p], since=d22)
+
+        self.assertEqual(s["tools"]["tools"], [["NewTool", 1]])
+        self.assertEqual(s["totals"]["calls"], 1)
+
+    def test_calls_total_matches_ranking_sum_under_since(self):
+        d22 = agg.local_day("2026-09-22T01:00:00.000Z")
+        p = agg.fold([tool("2026-09-20T01:00:00.000Z", "Bash"),
+                      tool("2026-09-22T01:00:00.000Z", "Bash"),
+                      tool("2026-09-22T01:00:00.000Z", "mcp__dbhub__execute_sql")])
+
+        s = agg.merge([p], since=d22)
+
+        ranked = sum(n for g in ("mcp", "skill", "tools")
+                     for _, n in s["tools"][g])
+        self.assertEqual(ranked, s["totals"]["calls"])
+
     def test_tools_ranked_descending(self):
         s = agg.merge([agg.fold([tool("2026-09-22T01:00:00.000Z", "Read"),
                                  tool("2026-09-22T01:00:00.000Z", "Bash"),
@@ -987,6 +1162,16 @@ class TestMerge(unittest.TestCase):
         self.assertEqual(s["sessions"]["s1"]["last_ts"], "2026-09-22T05:00:00.000Z")
         self.assertEqual(s["sessions"]["s1"]["last_ctx"], 901)
         self.assertEqual(s["totals"]["input"], 2)
+
+    def test_sidechain_tokens_survive_merge(self):
+        a = agg.fold([usage("2026-09-22T01:00:00.000Z", session="s1", input=7,
+                            sub=True)])
+        b = agg.fold([usage("2026-09-22T01:00:00.000Z", session="s1", input=3)])
+
+        s = agg.merge([a, b])
+
+        self.assertEqual(s["totals"]["input"], 10)   # 총계에는 둘 다
+        self.assertEqual(s["sessions"]["s1"]["last_ctx"], 3)  # 카드는 부모 것만
 
     def test_compact_stats(self):
         s = agg.merge([agg.fold([
@@ -1062,15 +1247,18 @@ def local_day(ts):
 
 
 def empty_partial():
-    return {"days": {}, "tools": {g: {} for g in GROUPS},
-            "compacts": [], "sessions": {}, "bad_lines": 0}
+    return {"days": {}, "compacts": [], "sessions": {}, "bad_lines": 0}
+
+
+def _empty_day():
+    """도구 집계가 날짜 안에 있다 — 기간 필터가 순위에도 걸려야 하기 때문이다."""
+    return {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0,
+            "calls": {g: 0 for g in GROUPS},
+            "labels": {g: {} for g in GROUPS}}
 
 
 def _day_bucket(partial, day):
-    return partial["days"].setdefault(day, {
-        "input": 0, "output": 0, "cache_read": 0, "cache_creation": 0,
-        "calls": {g: 0 for g in GROUPS},
-    })
+    return partial["days"].setdefault(day, _empty_day())
 
 
 def _session(partial, sid):
@@ -1080,7 +1268,13 @@ def _session(partial, sid):
 
 
 def fold(events, partial=None):
-    """이벤트들을 부분집계에 접어 넣는다. partial을 주면 그 위에 누적한다."""
+    """이벤트들을 부분집계에 접어 넣는다. partial을 주면 그 위에 누적한다.
+
+    `sub`가 참인 이벤트(서브에이전트)의 토큰과 도구 호출은 일별 집계에 들어간다 —
+    실제로 쓴 토큰이다. 다만 세션 상태(last_ts/last_ctx)는 갱신하지 않는다.
+    서브에이전트는 부모와 같은 sessionId를 쓰기 때문에, 갱신하면 사용자의 실시간
+    카드가 서브에이전트의 컨텍스트 점유를 사용자 것으로 표시한다.
+    """
     p = empty_partial() if partial is None else partial
 
     for e in events:
@@ -1093,6 +1287,8 @@ def fold(events, partial=None):
                 b = _day_bucket(p, day)
                 for k in ("input", "output", "cache_read", "cache_creation"):
                     b[k] += e.get(k, 0)
+            if e.get("sub"):
+                continue  # 토큰은 셌다. 세션 상태는 부모 것이므로 건드리지 않는다
             s = _session(p, sid)
             if e["ts"] >= s["last_ts"]:
                 s["last_ts"] = e["ts"]
@@ -1103,10 +1299,11 @@ def fold(events, partial=None):
 
         elif kind == "tool":
             group, label = classify_tool(e.get("name") or "", e.get("skill"))
-            p["tools"][group][label] = p["tools"][group].get(label, 0) + 1
             day = local_day(e["ts"])
             if day:
-                _day_bucket(p, day)["calls"][group] += 1
+                b = _day_bucket(p, day)
+                b["calls"][group] += 1
+                b["labels"][group][label] = b["labels"][group].get(label, 0) + 1
 
         elif kind == "compact":
             pre, post = e.get("pre", 0), e.get("post", 0)
@@ -1120,6 +1317,8 @@ def fold(events, partial=None):
             _session(p, sid)["title"] = e.get("title") or None
 
         elif kind == "activity":
+            if e.get("sub"):
+                continue
             s = _session(p, sid)
             if e["ts"] >= s["last_ts"]:
                 s["last_ts"] = e["ts"]
@@ -1159,29 +1358,18 @@ def merge(partials, since=None):
         for day, b in p.get("days", {}).items():
             if since and day < since:
                 continue
-            t = days.setdefault(day, {
-                "input": 0, "output": 0, "cache_read": 0, "cache_creation": 0,
-                "calls": {g: 0 for g in GROUPS},
-            })
+            t = days.setdefault(day, _empty_day())
             for k in ("input", "output", "cache_read", "cache_creation"):
                 t[k] += b.get(k, 0)
             for g in GROUPS:
                 t["calls"][g] += (b.get("calls") or {}).get(g, 0)
+                for label, cnt in ((b.get("labels") or {}).get(g) or {}).items():
+                    tools[g][label] = tools[g].get(label, 0) + cnt
 
         for c in p.get("compacts", []):
             if since and c.get("day", "") < since:
                 continue
             compacts.append(c)
-
-    # 기간 필터가 도구 순위에도 걸려야 하므로, 일별 호출 수에서 그룹 총합을 내고
-    # 라벨별 세부는 기간 필터가 없을 때만 정확하다. 기간이 걸린 경우를 위해
-    # 라벨별 집계도 일자와 함께 보관해야 정확하지만, 부분집계 크기를 감당하기
-    # 위해 라벨별은 파일 단위로만 나눈다. 따라서 since가 있으면 라벨 순위는
-    # 그 기간에 활동이 있던 파일들의 전체 라벨 집계다 -- UI에 그렇게 표기한다.
-    for p in partials:
-        for g in GROUPS:
-            for label, n in (p.get("tools", {}).get(g) or {}).items():
-                tools[g][label] = tools[g].get(label, 0) + n
 
     total_calls = sum(sum(d["calls"].values()) for d in days.values())
     totals = {k: sum(d[k] for d in days.values())
@@ -1202,8 +1390,11 @@ def merge(partials, since=None):
     }
 
     return {
-        "days": [dict(day=d, total=sum(v[k] for k in
-                      ("input", "output", "cache_read", "cache_creation")), **v)
+        "days": [{"day": d,
+                  "total": sum(v[k] for k in ("input", "output",
+                                              "cache_read", "cache_creation")),
+                  **{k: v[k] for k in ("input", "output", "cache_read",
+                                       "cache_creation", "calls")}}
                  for d, v in sorted(days.items())],
         "totals": totals,
         "tools": {g: sorted(([label, n] for label, n in tools[g].items()),
@@ -1221,7 +1412,7 @@ cd ~/Workspaces/13_AgentPulse
 python3 -m unittest tests.test_aggregate -v
 ```
 
-Expected: PASS — 27 tests
+Expected: PASS — 33 tests
 
 - [ ] **Step 5: 커밋**
 
@@ -1246,6 +1437,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 - Produces:
   - `pulse.inventory.installed_mcp_servers(claude_json_path) -> set[str]`
   - `pulse.inventory.installed_skills(roots: list) -> set[str]`
+    `roots`가 `None`이면 `DEFAULT_SKILL_ROOTS`. 빈 리스트는 "없음"이다.
   - `pulse.inventory.unused(summary_tools: dict, mcp: set, skills: set) -> dict`
     반환: `{"mcp": [str, ...], "skill": [str, ...], "count": int}` (각 리스트 정렬됨)
   - `pulse.inventory.DEFAULT_SKILL_ROOTS: list[Path]`
@@ -1294,6 +1486,14 @@ class TestInstalledSkills(unittest.TestCase):
 
     def test_missing_root_is_skipped(self):
         self.assertEqual(inv.installed_skills(["/nonexistent"]), set())
+
+
+class TestDefaultSkillRoots(unittest.TestCase):
+    def test_mode_bundles_are_not_counted(self):
+        """모드 번들을 세면 미사용이 314개가 되어 타일이 잡음이 된다(실측)."""
+        names = [p.name for p in inv.DEFAULT_SKILL_ROOTS]
+        self.assertNotIn("modes", names)
+        self.assertIn("skills", names)
 
 
 class TestUnused(unittest.TestCase):
@@ -1345,9 +1545,15 @@ CLAUDE_DIR = Path.home() / ".claude"
 DEFAULT_CLAUDE_JSON = Path.home() / ".claude.json"
 DEFAULT_SKILL_ROOTS = [
     CLAUDE_DIR / "skills",
-    CLAUDE_DIR / "modes",
     CLAUDE_DIR / "plugins" / "cache",
 ]
+"""모드 번들(~/.claude/modes)은 일부러 뺀다.
+
+모드는 전환식이라 한 번에 하나만 로드되는데, 디스크에는 어느 쪽이 활성인지
+표시가 없다. 전부 세면 실측 기준 미사용이 314개가 되어(ecc 번들 하나가
+292개) 타일이 잡음이 된다. 사용자가 손댈 수 있는 것은 자기 스킬과 설치한
+플러그인 스킬이다.
+"""
 
 
 def installed_mcp_servers(claude_json_path=DEFAULT_CLAUDE_JSON):
@@ -1396,7 +1602,7 @@ cd ~/Workspaces/13_AgentPulse
 python3 -m unittest tests.test_inventory -v
 ```
 
-Expected: PASS — 8 tests
+Expected: PASS — 9 tests
 
 - [ ] **Step 5: 커밋**
 
@@ -1510,6 +1716,16 @@ class TestActiveSessions(unittest.TestCase):
         result = live.active_sessions(sessions, CFG, now=self.now)
         self.assertEqual([r["session"] for r in result], ["high", "low"])
 
+    def test_naive_now_does_not_raise(self):
+        sessions = {"s1": {"title": "작업", "cwd": "/x", "model": "m",
+                           "last_ts": iso(self.now - timedelta(minutes=1)),
+                           "last_ctx": 100}}
+
+        result = live.active_sessions(sessions, CFG,
+                                      now=self.now.replace(tzinfo=None))
+
+        self.assertEqual(len(result), 1)
+
     def test_unparseable_timestamp_is_excluded(self):
         sessions = {"s1": {"title": "x", "cwd": "/x", "model": "m",
                            "last_ts": "not-a-date", "last_ctx": 1}}
@@ -1559,6 +1775,10 @@ def _parse(ts):
 
 def active_sessions(sessions, cfg, now=None):
     now = datetime.now(timezone.utc) if now is None else now
+    if now.tzinfo is None:
+        # 순진한 datetime을 받아도 죽지 않는다 — last_ts는 항상 tz를 달고 오므로
+        # 그대로 비교하면 TypeError가 나고, 5초마다 도는 페이지가 멈춘다
+        now = now.replace(tzinfo=timezone.utc)
     cutoff = now - timedelta(minutes=cfg["active_window_minutes"])
     limit = cfg["context_limit"]
 
@@ -1593,7 +1813,7 @@ cd ~/Workspaces/13_AgentPulse
 python3 -m unittest tests.test_live -v
 ```
 
-Expected: PASS — 11 tests
+Expected: PASS — 12 tests
 
 - [ ] **Step 5: 커밋**
 
@@ -1619,7 +1839,9 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 - Consumes: `scan.find_transcripts`, `scan.scan_file`, `aggregate.fold`, `aggregate.merge`, `cache.load_cache`, `cache.save_cache`
 - Produces:
   - `pulse.pipeline.refresh(projects_root, cache_path) -> tuple[list[dict], dict]`
-    반환 `(partials, cache)` — `partials`는 모든 파일의 부분집계 리스트
+    반환 `(partials, cache)` — `partials`는 모든 파일의 부분집계 리스트.
+    서브에이전트 구분은 경로가 아니라 레코드의 `isSidechain`으로 하며, 그 처리는
+    `scan`과 `aggregate`가 이미 한다. 파이프라인은 파일 종류를 구분하지 않는다.
   - `pulse.pipeline.since_for(range_key: str, today: str | None = None) -> str | None`
     `"7d" -> 6일 전 날짜`, `"30d" -> 29일 전`, `"all" -> None`
 
@@ -1637,10 +1859,10 @@ from pulse import aggregate as agg
 from pulse import pipeline
 
 
-def line(ts="2026-09-22T01:00:00.000Z", session="s1", inp=1):
+def line(ts="2026-09-22T01:00:00.000Z", session="s1", inp=1, sidechain=False):
     return json.dumps({
         "type": "assistant", "timestamp": ts, "sessionId": session,
-        "cwd": "/Users/teo",
+        "cwd": "/Users/teo", "isSidechain": sidechain,
         "message": {"role": "assistant", "model": "claude-opus-5", "content": [],
                     "usage": {"input_tokens": inp}},
     })
@@ -1728,6 +1950,23 @@ class TestRefresh(unittest.TestCase):
 
         self.assertEqual(agg.merge(partials)["totals"]["input"], 10)
         self.assertEqual(len(cache["files"]), 1)
+
+    def test_subagent_transcript_counts_but_does_not_move_parent_state(self):
+        # 서브에이전트 파일은 부모와 같은 sessionId를 쓴다(실측).
+        sub_dir = self.proj / "sess" / "subagents"
+        sub_dir.mkdir(parents=True)
+        with open(sub_dir / "agent-x.jsonl", "w", encoding="utf-8") as f:
+            f.write(line(ts="2026-09-22T05:00:00.000Z", session="s1", inp=4,
+                         sidechain=True) + "\n")
+        self.write("a.jsonl", [line(ts="2026-09-22T01:00:00.000Z",
+                                    session="s1", inp=6)])
+
+        partials, _ = pipeline.refresh(self.root / "projects", self.cache_path)
+        summary = agg.merge(partials)
+
+        self.assertEqual(summary["totals"]["input"], 10)  # 총계에 포함
+        self.assertEqual(summary["sessions"]["s1"]["last_ts"],
+                         "2026-09-22T01:00:00.000Z")   # 카드는 부모 시각
 
     def test_empty_root_gives_empty_summary(self):
         partials, cache = pipeline.refresh(self.root / "projects", self.cache_path)
@@ -1820,7 +2059,7 @@ cd ~/Workspaces/13_AgentPulse
 python3 -m unittest tests.test_pipeline -v
 ```
 
-Expected: PASS — 10 tests
+Expected: PASS — 11 tests
 
 - [ ] **Step 5: 실데이터로 증분 효과를 잰다**
 
@@ -1929,6 +2168,9 @@ class ServerTestCase(unittest.TestCase):
         self.httpd = server.make_server(state, port=0, web_dir=self.web)
         self.port = self.httpd.server_address[1]
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        # LIFO로 돌기 때문에 shutdown이 먼저, 그 다음 server_close다.
+        # server_close를 빠뜨리면 듣던 소켓이 남아 ResourceWarning이 뜬다.
+        self.addCleanup(self.httpd.server_close)
         self.addCleanup(self.httpd.shutdown)
 
     def get(self, path):
@@ -1983,12 +2225,15 @@ class TestApi(ServerTestCase):
         self.start()
         with self.assertRaises(urllib.error.HTTPError) as cm:
             self.get("/api/nope")
+        # HTTPError는 파일 객체다 — 닫지 않으면 ResourceWarning이 남는다
+        self.addCleanup(cm.exception.close)
         self.assertEqual(cm.exception.code, 404)
 
     def test_path_traversal_is_refused(self):
         self.start()
         with self.assertRaises(urllib.error.HTTPError) as cm:
             self.get("/../../etc/passwd")
+        self.addCleanup(cm.exception.close)
         self.assertIn(cm.exception.code, (400, 403, 404))
 
     def test_binds_loopback_only(self):
@@ -2021,6 +2266,54 @@ class TestPortFallback(ServerTestCase):
 
         with self.assertRaises(OSError):
             server.bind(self._state(), port=busy, web_dir=self.web, attempts=1)
+
+
+class TestConcurrency(ServerTestCase):
+    def test_simultaneous_summary_and_live_both_succeed(self):
+        """페이지가 뜰 때 두 요청이 동시에 나간다 — 실측으로 한쪽이 끊기던 경로."""
+        import threading
+
+        (self.projects / "a.jsonl").write_text(line() + "\n", encoding="utf-8")
+        self.start()
+        results = []
+
+        def hit(path):
+            try:
+                results.append(self.get(path)[0])
+            except Exception as e:  # noqa: BLE001
+                results.append(repr(e))
+
+        for _ in range(5):
+            ts = [threading.Thread(target=hit, args=(p,))
+                  for p in ("/api/summary?range=7d", "/api/live")]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+
+        self.assertEqual(results, [200] * 10)
+
+
+class TestApiErrorHandling(ServerTestCase):
+    def test_failure_inside_summary_returns_500_not_a_dropped_connection(self):
+        class Boom(server.State):
+            def summary(self, range_key):
+                raise RuntimeError("집계 실패")
+
+        state = Boom(cfg=CFG, projects_root=self.root / "projects",
+                     cache_path=self.root / "cache.json",
+                     claude_json=self.claude_json, skill_roots=[])
+        self.httpd = server.make_server(state, port=0, web_dir=self.web)
+        self.port = self.httpd.server_address[1]
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.addCleanup(self.httpd.server_close)
+        self.addCleanup(self.httpd.shutdown)
+
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            self.get("/api/summary?range=7d")
+        self.addCleanup(cm.exception.close)
+        self.assertEqual(cm.exception.code, 500)
+        self.assertEqual(json.loads(cm.exception.read())["error"], "RuntimeError")
 
 
 class TestEmptyEnvironment(ServerTestCase):
@@ -2060,7 +2353,9 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'pulse.server'`
 
 ```python
 """localhost 전용 HTTP 서버. 조립해서 JSON으로 낼 뿐 계산하지 않는다."""
+import traceback
 import json
+import threading
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -2081,10 +2376,18 @@ class State:
         self.cache_path = cache_path
         self.claude_json = claude_json or inventory.DEFAULT_CLAUDE_JSON
         self.skill_roots = skill_roots
+        self._lock = threading.Lock()
 
     def _partials(self):
-        partials, _ = pipeline.refresh(self.projects_root, self.cache_path)
-        return partials
+        """갱신은 한 번에 하나만 돈다.
+
+        페이지가 뜰 때 /api/summary와 /api/live가 동시에 나가는데, 둘 다 같은
+        캐시 파일을 갱신한다. 직렬화하지 않으면 두 스레드가 같은 캐시를 두고
+        경쟁한다 — 실측으로 로드마다 한쪽 요청이 끊겼다.
+        """
+        with self._lock:
+            partials, _ = pipeline.refresh(self.projects_root, self.cache_path)
+            return partials
 
     def summary(self, range_key):
         since = pipeline.since_for(range_key)
@@ -2131,18 +2434,22 @@ def _handler_class(state, web_dir):
             parsed = urlparse(self.path)
             route = parsed.path
 
-            if route == "/api/summary":
-                q = parse_qs(parsed.query)
-                range_key = (q.get("range") or ["7d"])[0]
-                if range_key not in ("7d", "30d", "all"):
-                    range_key = "7d"
-                return self._json(state.summary(range_key))
-
-            if route == "/api/live":
-                return self._json(state.live())
-
             if route.startswith("/api/"):
-                return self._json({"error": "not found"}, status=404)
+                # 집계 중 예외가 나도 연결을 끊지 않는다 — 끊기면 브라우저에는
+                # 원인 없는 실패로만 보이고, 5초마다 조용히 반복된다.
+                try:
+                    if route == "/api/summary":
+                        q = parse_qs(parsed.query)
+                        range_key = (q.get("range") or ["7d"])[0]
+                        if range_key not in ("7d", "30d", "all"):
+                            range_key = "7d"
+                        return self._json(state.summary(range_key))
+                    if route == "/api/live":
+                        return self._json(state.live())
+                    return self._json({"error": "not found"}, status=404)
+                except Exception as e:  # noqa: BLE001 - 대시보드를 죽이지 않는다
+                    traceback.print_exc()
+                    return self._json({"error": type(e).__name__}, status=500)
 
             return super().do_GET()
 
@@ -2238,7 +2545,7 @@ cd ~/Workspaces/13_AgentPulse
 python3 -m unittest tests.test_server -v
 ```
 
-Expected: PASS — 13 tests
+Expected: PASS — 25 tests
 
 - [ ] **Step 5: 전체 테스트를 돌린다**
 
@@ -2367,7 +2674,9 @@ const $ = (id) => document.getElementById(id);
 
 // ---- 포맷 ----------------------------------------------------------------
 function human(n) {
+  // 누적 처리 토큰은 실측 50억대까지 간다. B 단위가 없으면 "5013.6M"이 된다.
   if (n === null || n === undefined) return "–";
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + "B";
   if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
   if (n >= 1e3) return Math.round(n / 1e3) + "K";
   return String(n);
@@ -2393,7 +2702,7 @@ function renderSessions(data) {
   box.innerHTML = data.sessions.map((s) => {
     const width = Math.min(100, (s.ratio ?? 0) * 100);
     return `
-      <article class="card ${s.status}">
+      <article class="card ${escape_(s.status)}">
         <div class="card-top">
           <div>
             <div class="title">${escape_(s.title)}</div>
@@ -2513,8 +2822,10 @@ async function get(path) {
   return r.json();
 }
 
-async function tickLive() {
-  if (document.hidden) return;          // 배경 탭에서는 쉰다
+async function tickLive({ force = false } = {}) {
+  // 배경 탭에서는 쉰다. 다만 첫 렌더는 예외 — 안 그러면 배경 탭에서 연 사용자는
+  // 빈 상태 문구조차 없는 빈 영역을 보게 된다.
+  if (document.hidden && !force) return;
   try { renderSessions(await get("/api/live")); setConn(true); }
   catch { setConn(false); }             // 화면은 그대로 둔다
 }
@@ -2535,8 +2846,8 @@ $("range-tabs").addEventListener("click", (e) => {
 document.addEventListener("visibilitychange", () => { if (!document.hidden) tickLive(); });
 
 loadSummary();
-tickLive();
-setInterval(tickLive, POLL_MS);
+tickLive({ force: true });
+setInterval(() => tickLive(), POLL_MS);
 ```
 
 - [ ] **Step 4: 스타일을 쓴다**
@@ -2545,7 +2856,8 @@ setInterval(tickLive, POLL_MS);
 .conn.down .block .cards .card .card.ok .card.caution .card.danger .title .meta
 .big .bar-track .bar-fill .bar-mark .card-foot .badge .tabs button .tabs
 button.on .tiles .tile .k .s .panel .panel-head .legend .sw .sw-mcp .sw-skill
-.sw-tools .ranks .rank .name .n .mini .empty .foot`, 그리고 SVG 안의
+.sw-tools .ranks .rank .name .n .mini .empty .foot`, 상태 클래스 네 가지
+(`.card.ok .card.caution .card.danger .card.unknown`), 그리고 SVG 안의
 `.grid .ax .b-mcp .b-skill .b-tools`.
 
 요구사항:
@@ -2555,6 +2867,11 @@ button.on .tiles .tile .k .s .panel .panel-head .legend .sw .sw-mcp .sw-skill
   **dataviz 스킬의 팔레트에서 가져온다.** 두 팔레트를 섞지 않는다 — 그룹 색은
   범주형, 상태 색은 순서형이다.
 - `.card.danger`는 테두리와 `.bar-fill`이 위험 색, `.card.caution`은 주의 색.
+- **`.card.unknown`도 반드시 정의한다.** `live.context_status`는 컨텍스트를 알 수
+  없을 때(`used`가 None, 한도가 0) 실제로 `"unknown"`을 낸다. 정의하지 않으면
+  기본값인 `ok` 색이 그대로 먹어, 판단 불가 상태가 "여유"와 똑같은 초록으로
+  보인다 — 압축을 경고하려고 만든 화면에서 가장 나쁜 오독이다. 중립적인
+  회색 계열로, `.bar-fill`과 `.badge` 모두 덮어쓴다.
 - `.bar-mark`는 트랙 위 세로 눈금 1px — 경고 임계가 어디인지 보여준다.
 - 숫자에 `font-variant-numeric: tabular-nums` — 5초마다 갱신되므로 자릿수가
   흔들리면 눈이 아프다.
@@ -2599,6 +2916,11 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 
 ### Task 10: 컨텍스트 경고 훅
 
+> **함께 처리하는 이월 항목 (룰링 R17):** `tests/test_aggregate.py`의
+> `test_incremental_equals_whole`에 서브에이전트 이벤트를 섞는 변경이 계획에
+> 반영돼 있다(Task 4 절). 세션 상태를 건너뛰는 분기가 분할 지점에 의존하지
+> 않는지 확인하는 것으로, 이 태스크와 함께 적용한다.
+
 **Files:**
 - Create: `hooks/context_alert.py`
 - Create: `tests/test_context_alert.py`
@@ -2606,9 +2928,24 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 **Interfaces:**
 - Consumes: `config.load_config`
 - Produces: 실행 가능한 스크립트. Claude Code가 Stop 훅으로 부른다.
-  - `hooks.context_alert.should_alert(payload: dict, cfg: dict, seen: dict) -> tuple[bool, dict]`
+  - `hooks.context_alert.context_used(transcript_path) -> int | None`
+  - `hooks.context_alert.should_alert(payload, cfg, seen, used) -> tuple[bool, dict]`
     반환 `(발화할지, 갱신된 seen)`
-  - `hooks.context_alert.message(payload: dict, cfg: dict) -> tuple[str, str]` — `(제목, 본문)`
+  - `hooks.context_alert.message(used: int, cfg: dict) -> tuple[str, str]` — `(제목, 본문)`
+
+  **실측한 Stop 훅 payload** (2026-09-22, 실제 캡처):
+
+  ```
+  background_tasks, cwd, effort, hook_event_name, last_assistant_message,
+  permission_mode, prompt_id, scratchpad_dir, session_crons, session_id,
+  stop_hook_active, transcript_path
+  ```
+
+  `context_window`가 **없다**. statusline payload에는 있지만 Stop 훅에는 없다.
+  그래서 훅은 `transcript_path`를 직접 읽어 점유를 계산한다. 확인된 등가성:
+  statusline이 보고한 `total_input_tokens` 561,488과
+  `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`
+  (2 + 560,864 + 622)가 정확히 일치한다.
 
 - [ ] **Step 1: 실패하는 테스트를 쓴다**
 
@@ -2630,65 +2967,132 @@ CFG = {"context_limit": 1_000_000, "warn_threshold": 0.85,
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def payload(pct=90.0, session="s1"):
-    return {"session_id": session, "context_window": {"used_percentage": pct}}
+def rec(used, sidechain=False, kind="assistant"):
+    return json.dumps({
+        "type": kind, "sessionId": "s1", "isSidechain": sidechain,
+        "message": {"role": "assistant", "model": "m",
+                    "usage": {"input_tokens": 0,
+                              "cache_read_input_tokens": used,
+                              "cache_creation_input_tokens": 0}},
+    })
+
+
+def transcript(lines):
+    d = Path(tempfile.mkdtemp())
+    p = d / "t.jsonl"
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return p
+
+
+def payload(session="s1", transcript_path=""):
+    # 실측한 Stop 훅 payload에는 context_window가 없다. session_id와
+    # transcript_path가 훅이 쓰는 전부다.
+    return {"session_id": session, "transcript_path": str(transcript_path),
+            "hook_event_name": "Stop", "cwd": "/Users/teo"}
+
+
+class TestContextUsed(unittest.TestCase):
+    def test_reads_last_assistant_usage(self):
+        p = transcript([rec(100), rec(900_000)])
+        self.assertEqual(alert.context_used(p), 900_000)
+
+    def test_skips_sidechain_records(self):
+        # 서브에이전트는 부모와 세션 id를 공유한다. 그 점유는 사용자 것이 아니다.
+        p = transcript([rec(900_000), rec(50, sidechain=True)])
+        self.assertEqual(alert.context_used(p), 900_000)
+
+    def test_ignores_non_assistant_records(self):
+        p = transcript([rec(900_000), rec(1, kind="user")])
+        self.assertEqual(alert.context_used(p), 900_000)
+
+    def test_broken_lines_are_skipped(self):
+        p = transcript([rec(900_000), "{깨진 줄"])
+        self.assertEqual(alert.context_used(p), 900_000)
+
+    def test_no_assistant_records_gives_none(self):
+        p = transcript([rec(1, kind="user")])
+        self.assertIsNone(alert.context_used(p))
+
+    def test_missing_file_gives_none(self):
+        self.assertIsNone(alert.context_used("/nonexistent/t.jsonl"))
+
+    def test_empty_path_gives_none(self):
+        self.assertIsNone(alert.context_used(""))
+
+    def test_finds_recent_record_in_a_file_larger_than_the_tail(self):
+        # 꼬리만 읽는다. 오래된 줄로 파일을 부풀려도 최근 값을 찾아야 한다.
+        filler = [rec(1)] * 4000
+        p = transcript(filler + [rec(777_000)])
+        self.assertGreater(p.stat().st_size, alert.TAIL_BYTES)
+        self.assertEqual(alert.context_used(p), 777_000)
 
 
 class TestShouldAlert(unittest.TestCase):
     def test_below_threshold_is_quiet(self):
-        fire, _ = alert.should_alert(payload(pct=50.0), CFG, {})
+        fire, _ = alert.should_alert(payload(), CFG, {}, 500_000)
         self.assertFalse(fire)
 
     def test_above_threshold_fires(self):
-        fire, seen = alert.should_alert(payload(pct=90.0), CFG, {})
+        fire, seen = alert.should_alert(payload(), CFG, {}, 900_000)
         self.assertTrue(fire)
         self.assertIn("s1", seen)
 
     def test_exactly_at_threshold_fires(self):
-        fire, _ = alert.should_alert(payload(pct=85.0), CFG, {})
+        fire, _ = alert.should_alert(payload(), CFG, {}, 850_000)
         self.assertTrue(fire)
 
     def test_same_session_fires_only_once(self):
-        fire, seen = alert.should_alert(payload(pct=90.0), CFG, {})
+        fire, seen = alert.should_alert(payload(), CFG, {}, 900_000)
         self.assertTrue(fire)
-        fire2, _ = alert.should_alert(payload(pct=95.0), CFG, seen)
+        fire2, _ = alert.should_alert(payload(), CFG, seen, 950_000)
         self.assertFalse(fire2)
 
     def test_different_session_fires_separately(self):
-        _, seen = alert.should_alert(payload(pct=90.0, session="s1"), CFG, {})
-        fire, _ = alert.should_alert(payload(pct=90.0, session="s2"), CFG, seen)
+        _, seen = alert.should_alert(payload(session="s1"), CFG, {}, 900_000)
+        fire, _ = alert.should_alert(payload(session="s2"), CFG, seen, 900_000)
         self.assertTrue(fire)
 
-    def test_missing_context_window_is_quiet(self):
-        fire, _ = alert.should_alert({"session_id": "s1"}, CFG, {})
+    def test_unknown_usage_is_quiet(self):
+        fire, _ = alert.should_alert(payload(), CFG, {}, None)
         self.assertFalse(fire)
 
     def test_missing_session_id_is_quiet(self):
-        fire, _ = alert.should_alert({"context_window": {"used_percentage": 99}},
-                                     CFG, {})
+        fire, _ = alert.should_alert({"transcript_path": "/x"}, CFG, {}, 900_000)
+        self.assertFalse(fire)
+
+    def test_zero_limit_is_quiet_not_a_division_error(self):
+        cfg = {**CFG, "context_limit": 0}
+        fire, _ = alert.should_alert(payload(), cfg, {}, 900_000)
         self.assertFalse(fire)
 
 
 class TestMessage(unittest.TestCase):
     def test_message_reports_percent_and_remaining(self):
-        title, body = alert.message(payload(pct=90.0), CFG)
+        title, body = alert.message(900_000, CFG)
         self.assertIn("90%", body)
-        self.assertIn("100K", body)  # 1,000,000의 10%
+        self.assertIn("100K", body)
         self.assertTrue(title)
 
-    def test_message_has_no_shell_metacharacters_from_input(self):
-        # osascript에 문자열을 넘기므로 따옴표가 새어나가면 안 된다
-        p = {"session_id": 's"1', "context_window": {"used_percentage": 90.0}}
-        _, body = alert.message(p, CFG)
+    def test_message_has_no_quotes(self):
+        # osascript에 넘기는 문자열이라 따옴표가 새어나가면 안 된다
+        _, body = alert.message(900_000, CFG)
         self.assertNotIn('"', body)
 
 
 class TestScriptNeverFails(unittest.TestCase):
-    def run_script(self, stdin_text, alerted_path):
+    def run_script(self, stdin_text, alerted_path, cwd=None):
+        """설정 경로도 주입한다 — 안 그러면 실제 ~/.claude를 읽는다."""
+        d = Path(tempfile.mkdtemp())
+        settings = d / "settings.json"
+        settings.write_text(json.dumps({"model": "opus[1m]"}), encoding="utf-8")
         return subprocess.run(
             [sys.executable, str(ROOT / "hooks" / "context_alert.py"),
-             "--alerted-path", str(alerted_path), "--dry-run"],
-            input=stdin_text, text=True, capture_output=True, cwd=ROOT,
+             "--alerted-path", str(alerted_path),
+             "--config-path", str(d / "absent.json"),
+             "--settings-path", str(settings),
+             "--dry-run"],
+            input=stdin_text, text=True, capture_output=True,
+            cwd=cwd or ROOT,
         )
 
     def test_broken_stdin_exits_zero(self):
@@ -2703,14 +3107,46 @@ class TestScriptNeverFails(unittest.TestCase):
 
     def test_dry_run_prints_when_over_threshold(self):
         d = Path(tempfile.mkdtemp())
-        r = self.run_script(json.dumps(payload(pct=99.0)), d / "alerted.json")
+        p = transcript([rec(990_000)])
+        r = self.run_script(json.dumps(payload(transcript_path=p)),
+                            d / "alerted.json")
         self.assertEqual(r.returncode, 0)
         self.assertIn("99", r.stdout)
 
+    def test_quiet_when_transcript_missing(self):
+        d = Path(tempfile.mkdtemp())
+        r = self.run_script(json.dumps(payload(transcript_path="/nope.jsonl")),
+                            d / "alerted.json")
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.stdout, "")
+
+    def test_works_from_an_unrelated_cwd(self):
+        """Claude Code는 사용자의 프로젝트 디렉터리를 cwd로 훅을 실행한다.
+
+        프로젝트 루트에서만 돌려보면 sys.path가 우연히 맞아 통과한다 —
+        그래서 이 테스트가 없으면 훅이 실무에서 조용히 죽는 것을 못 잡는다.
+        """
+        d = Path(tempfile.mkdtemp())
+        p = transcript([rec(990_000)])
+        r = self.run_script(json.dumps(payload(transcript_path=p)),
+                            d / "alerted.json", cwd=d)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("99", r.stdout)
+        self.assertEqual(r.stderr, "")
+
     def test_unwritable_alerted_path_exits_zero(self):
-        r = self.run_script(json.dumps(payload(pct=99.0)),
+        p = transcript([rec(990_000)])
+        r = self.run_script(json.dumps(payload(transcript_path=p)),
                             "/nonexistent-root/alerted.json")
         self.assertEqual(r.returncode, 0)
+
+    def test_unwritable_alerted_path_does_not_alert_every_turn(self):
+        """기록이 안 되면 조용히 넘어간다. 턴마다 울리는 알림이 더 나쁘다."""
+        p = transcript([rec(990_000)])
+        outs = [self.run_script(json.dumps(payload(transcript_path=p)),
+                                "/nonexistent-root/alerted.json").stdout
+                for _ in range(3)]
+        self.assertEqual(outs, ["", "", ""])
 
 
 if __name__ == "__main__":
@@ -2741,12 +3177,20 @@ Claude Code의 턴이 막힌다.
 """
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
+# Claude Code는 훅을 **사용자의 프로젝트 디렉터리**를 cwd로 실행한다.
+# 이 줄이 없으면 `from pulse import config`가 실패하고, 아래에서 모든 예외를
+# 삼키도록 설계돼 있어 아무 알림도 안 뜬 채 조용히 끝난다.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 CLAUDE_DIR = Path.home() / ".claude"
 DEFAULT_ALERTED_PATH = CLAUDE_DIR / "pulse-alerted.json"
+
+TAIL_BYTES = 512 * 1024
 
 
 def _human(n):
@@ -2757,26 +3201,78 @@ def _human(n):
     return str(n)
 
 
-def should_alert(payload, cfg, seen):
+def _tail_lines(path, max_bytes=TAIL_BYTES):
+    """파일 끝에서 최대 max_bytes만 읽어 줄 목록으로 돌려준다.
+
+    훅은 매 턴 돈다. 트랜스크립트는 수십 MB까지 자라므로 전체를 읽으면
+    턴마다 지연이 붙는다.
+    """
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        start = max(0, size - max_bytes)
+        f.seek(start)
+        data = f.read()
+    lines = data.split(b"\n")
+    if start:
+        lines = lines[1:]  # 잘렸을 첫 줄은 버린다
+    return lines
+
+
+def context_used(transcript_path):
+    """세션의 현재 컨텍스트 점유(토큰). 알 수 없으면 None.
+
+    Stop 훅 payload에는 context_window가 없다(실측). transcript_path는 있으므로
+    마지막 assistant 레코드의 usage에서 직접 계산한다. 서브에이전트(isSidechain)
+    레코드는 부모와 세션 id를 공유하므로 건너뛴다 — 그러지 않으면 서브에이전트의
+    점유를 사용자 것으로 착각한다.
+    """
+    if not transcript_path:
+        return None
+    try:
+        lines = _tail_lines(transcript_path)
+    except OSError:
+        return None
+
+    for raw in reversed(lines):
+        if not raw.strip():
+            continue
+        try:
+            d = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(d, dict) or d.get("type") != "assistant":
+            continue
+        if d.get("isSidechain"):
+            continue
+        usage = (d.get("message") or {}).get("usage") or {}
+        if not usage:
+            continue
+        return (usage.get("input_tokens", 0)
+                + usage.get("cache_read_input_tokens", 0)
+                + usage.get("cache_creation_input_tokens", 0))
+    return None
+
+
+def should_alert(payload, cfg, seen, used):
     """(발화할지, 갱신된 seen). 세션당 한 번만 발화한다."""
     session = payload.get("session_id")
-    window = payload.get("context_window") or {}
-    pct = window.get("used_percentage")
+    limit = cfg["context_limit"]
 
-    if not session or not isinstance(pct, (int, float)):
+    if not session or used is None or not limit:
         return False, seen
-    if pct / 100 < cfg["warn_threshold"]:
+    if used / limit < cfg["warn_threshold"]:
         return False, seen
     if session in seen:
         return False, seen
 
-    return True, {**seen, session: pct}
+    return True, {**seen, session: round(used / limit * 100, 1)}
 
 
-def message(payload, cfg):
-    pct = (payload.get("context_window") or {}).get("used_percentage") or 0
+def message(used, cfg):
     limit = cfg["context_limit"]
-    remaining = max(0, int(limit * (100 - pct) / 100))
+    pct = used / limit * 100
+    remaining = max(0, limit - used)
     title = "컨텍스트 경고"
     body = (f"컨텍스트 {pct:.0f}% 사용 · 약 {_human(remaining)} 남음. "
             f"정리하거나 새 세션으로 옮길 때입니다.")
@@ -2795,6 +3291,9 @@ def _notify(title, body):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--alerted-path", default=str(DEFAULT_ALERTED_PATH))
+    # 설정 경로도 주입할 수 있어야 테스트가 실제 ~/.claude를 읽지 않는다.
+    ap.add_argument("--config-path", default=None)
+    ap.add_argument("--settings-path", default=None)
     ap.add_argument("--dry-run", action="store_true",
                     help="알림을 띄우는 대신 표준출력에 찍는다 (테스트용)")
     args = ap.parse_args()
@@ -2802,7 +3301,8 @@ def main():
     from pulse import config
 
     payload = json.loads(sys.stdin.read())
-    cfg = config.load_config()
+    cfg = config.load_config(config_path=args.config_path,
+                             settings_path=args.settings_path)
 
     alerted_path = Path(args.alerted_path)
     try:
@@ -2812,25 +3312,31 @@ def main():
     except (OSError, ValueError):
         seen = {}
 
-    fire, seen = should_alert(payload, cfg, seen)
+    used = context_used(payload.get("transcript_path"))
+    fire, seen = should_alert(payload, cfg, seen, used)
     if not fire:
         return
 
-    title, body = message(payload, cfg)
+    # 기록이 먼저다. 알린 뒤에 기록하면, 기록이 계속 실패할 때(디스크 가득,
+    # 권한) 매 턴 알림이 다시 뜬다. 턴마다 울리는 알림은 한 번도 안 울리는
+    # 것보다 나쁘다 — 사용자는 그냥 알림을 꺼버린다.
+    alerted_path.parent.mkdir(parents=True, exist_ok=True)
+    alerted_path.write_text(json.dumps(seen), encoding="utf-8")
+
+    title, body = message(used, cfg)
     if args.dry_run:
         print(f"{title}: {body}")
     else:
         _notify(title, body)
 
-    alerted_path.parent.mkdir(parents=True, exist_ok=True)
-    alerted_path.write_text(json.dumps(seen), encoding="utf-8")
-
 
 if __name__ == "__main__":
     try:
         main()
-    except Exception:
-        pass  # 훅은 Claude Code를 절대 막지 않는다
+    except BaseException:
+        # Exception만 잡으면 argparse의 SystemExit이 새어나가 종료코드가 2가 된다.
+        # 훅은 무슨 일이 있어도 Claude Code를 막지 않는다.
+        pass
     sys.exit(0)
 ```
 
@@ -2843,15 +3349,21 @@ cd ~/Workspaces/13_AgentPulse
 python3 -m unittest tests.test_context_alert -v
 ```
 
-Expected: PASS — 13 tests
+Expected: PASS — 15 tests
 
 - [ ] **Step 5: 알림이 실제로 뜨는지 눈으로 확인한다**
 
 ```bash
 cd ~/Workspaces/13_AgentPulse
-echo '{"session_id":"manual-test","context_window":{"used_percentage":91}}' \
-  | python3 hooks/context_alert.py --alerted-path /tmp/pulse-alerted-test.json
-rm -f /tmp/pulse-alerted-test.json
+python3 -c "
+import json, pathlib
+p = pathlib.Path('/tmp/pulse-manual-transcript.jsonl')
+p.write_text(json.dumps({'type':'assistant','isSidechain':False,'message':{
+  'role':'assistant','model':'m','usage':{'input_tokens':0,
+  'cache_read_input_tokens':910000,'cache_creation_input_tokens':0}}}) + '\n')
+print(json.dumps({'session_id':'manual-test','transcript_path':str(p)}))
+" | python3 hooks/context_alert.py --alerted-path /tmp/pulse-alerted-test.json
+rm -f /tmp/pulse-alerted-test.json /tmp/pulse-manual-transcript.jsonl
 ```
 
 Expected: macOS 알림 배너가 뜬다. 안 뜨면 시스템 설정 → 알림에서 터미널 앱의 알림이 꺼져 있는지 확인한다.
@@ -2936,6 +3448,38 @@ echo '{"model":{"display_name":"Opus 5"},"workspace":{"current_dir":"/Users/teo"
 
 Expected: 첫 줄은 `ctx 36%`가 평소대로, 둘째 줄은 `⚠ ctx 91%(90K 남음)`. 예외 없음.
 
+- [ ] **Step 3.5: 실제 훅 payload의 필드 이름을 확인한다**
+
+훅은 지금까지 합성 payload로만 테스트됐다. Claude Code가 Stop 훅에 실제로 무엇을
+주는지 확인하지 않고 등록하면, 필드 이름이 다를 경우 훅이 예외를 삼키고 조용히
+아무것도 안 한다 — 테스트는 전부 통과한 채로.
+
+먼저 캡처용 훅을 임시로 등록한다. `hooks.Stop[0].hooks` 배열에 추가:
+
+```json
+{ "type": "command",
+  "command": "cat > /tmp/pulse-hook-payload.json",
+  "async": true }
+```
+
+한 턴이 지난 뒤 확인한다:
+
+```bash
+python3 -c "
+import json
+d = json.load(open('/tmp/pulse-hook-payload.json'))
+print('최상위 키:', sorted(d))
+print('session_id 있나:', 'session_id' in d)
+cw = d.get('context_window')
+print('context_window:', json.dumps(cw, ensure_ascii=False) if cw else '없음')
+"
+```
+
+Expected: `session_id`가 있고, `context_window.used_percentage`가 숫자다.
+**다르면 멈추고 보고한다** — `hooks/context_alert.py`의 `should_alert`와
+`message`가 읽는 키를 실제 이름에 맞춰야 한다. 확인이 끝나면 캡처용 훅 항목을
+지우고 `/tmp/pulse-hook-payload.json`도 지운다.
+
 - [ ] **Step 4: Stop 훅을 등록한다**
 
 `~/.claude/settings.json`의 `hooks.Stop[0].hooks` 배열에 항목을 **추가**한다. 기존 `afplay` 항목은 지우지 않는다. 결과는 이렇게 된다:
@@ -2985,6 +3529,9 @@ Expected: `Stop 훅 2 개`, 둘 다 나열되고 `OK`.
 - 실행법: `python3 pulse.py`, 기본 주소
 - 설정: `~/.claude/pulse-config.json`의 키와 기본값 (Global Constraints의 값 그대로)
 - **teo 님 환경의 실측 근거** — 모델이 `opus[1m]`이라 컨텍스트가 1M이고, 실제 압축은 967K 부근에서 걸렸으며, 그래서 경고 임계값이 85%라는 것. 통설인 "200K마다 압축"이 이 환경에 해당하지 않는다는 점.
+- **"기간 내 미사용"이 세는 범위** — `~/.claude/skills`와 설치된 플러그인 스킬,
+  그리고 `.claude.json`의 MCP 서버. `~/.claude/modes` 아래 모드 번들은 전환식이라
+  제외한다(전부 세면 314개가 되어 의미가 없다)
 - 이 도구가 건드리는 파일 목록(`pulse-cache.json`, `pulse-config.json`, `pulse-alerted.json`, 그리고 Task 11이 고친 `statusline.py`·`settings.json`과 그 백업 위치)
 - 원복 방법: 백업 파일을 되돌리고 settings.json에서 훅 항목을 지우면 된다는 것
 - 테스트 실행 명령

@@ -1,0 +1,452 @@
+/* AgentPulse — dark-first dashboard styles.
+   Palette source: dataviz skill, references/palette.md (dark column).
+   Categorical (entity, MCP/Skill/Tools) and status (ok/caution/danger)
+   are two separate palettes and are never mixed. */
+
+:root {
+  color-scheme: dark;
+
+  /* chrome & ink (dataviz palette.md, dark column) */
+  --page:      #0d0d0d;
+  --surface:   #1a1a19;
+  --surface-2: #212120;
+  --ink:       #ffffff;
+  --ink-2:     #c3c2b7;
+  --muted:     #898781;
+  --grid:      #2c2c2a;
+  --axis:      #383835;
+  --border:    rgba(255, 255, 255, 0.10);
+
+  /* categorical (identity) — fixed order, never cycled or reused as status */
+  --series-mcp:   #3987e5; /* slot 1 blue   */
+  --series-skill: #d95926; /* slot 2 orange */
+  --series-tools: #199e70; /* slot 3 aqua   */
+
+  /* status (ordered state) — fixed, never themed, never used for series */
+  --status-ok:      #0ca30c;
+  --status-caution: #fab219;
+  --status-danger:  #d03b3b;
+
+  /* "unknown" is the absence of a reading, not a level on the ok/caution/danger
+     scale and not an entity on the categorical scale — neutral grey, its own slot */
+  --status-unknown: #7a7a76;
+
+  --radius: 10px;
+  --radius-sm: 6px;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  max-width: 100%;
+  overflow-x: hidden;
+}
+
+body {
+  background: var(--page);
+  color: var(--ink);
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-variant-numeric: tabular-nums; /* values repaint every 5s — digits must not jitter */
+  line-height: 1.4;
+}
+
+h1, h2, h3 { margin: 0; font-weight: 600; }
+
+/* ---- header ------------------------------------------------------------ */
+
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 14px 20px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.bar h1 { font-size: 18px; letter-spacing: 0.02em; }
+
+.tag {
+  font-size: 12px;
+  color: var(--ink-2);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 10px;
+}
+
+.spacer { flex: 1 1 auto; }
+
+.conn {
+  font-size: 12px;
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.conn::before {
+  content: "";
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+.conn.up { color: var(--status-ok); }
+.conn.up::before { background: var(--status-ok); }
+.conn.down { color: var(--status-danger); }
+.conn.down::before { background: var(--status-danger); }
+
+/* ---- layout -------------------------------------------------------------- */
+
+.block {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 24px 20px;
+}
+
+.block h2 {
+  font-size: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 14px;
+}
+
+.block h2 small {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--muted);
+}
+
+#range-note { display: inline; margin-left: 6px; }
+
+/* ---- live session cards -------------------------------------------------- */
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 14px;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+}
+
+.card.ok      { border-color: rgba(12, 163, 12, 0.35); }
+.card.caution { border-color: var(--status-caution); }
+.card.danger  { border-color: var(--status-danger); }
+.card.unknown { border-color: var(--status-unknown); }
+
+.card-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.title {
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 34ch;
+}
+
+.meta {
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 3px;
+  overflow-wrap: anywhere;
+}
+
+.big {
+  font-size: 22px;
+  font-weight: 600;
+  color: var(--ink);
+  flex: none;
+}
+
+.bar-track {
+  position: relative;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--axis);
+  margin: 12px 0 10px;
+  overflow: hidden;
+}
+
+.bar-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--status-ok);
+}
+.card.caution .bar-fill { background: var(--status-caution); }
+.card.danger  .bar-fill { background: var(--status-danger); }
+.card.unknown .bar-fill { background: var(--status-unknown); }
+
+.bar-mark {
+  position: absolute;
+  top: -2px;
+  bottom: -2px;
+  width: 1px;
+  background: rgba(255, 255, 255, 0.55);
+}
+
+.card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+  color: var(--ink-2);
+}
+
+.badge {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 9px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--status-ok);
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.badge::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.card.caution .badge { color: var(--status-caution); }
+.card.danger  .badge { color: var(--status-danger); }
+.card.unknown .badge { color: var(--status-unknown); }
+
+.empty {
+  color: var(--muted);
+  font-size: 13px;
+  padding: 18px 4px;
+  text-align: center;
+}
+
+/* ---- range tabs ----------------------------------------------------------- */
+
+.tabs {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+
+.tabs button {
+  font: inherit;
+  font-size: 13px;
+  color: var(--ink-2);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 6px 14px;
+  cursor: pointer;
+}
+
+.tabs button:hover { color: var(--ink); }
+
+.tabs button.on {
+  background: var(--surface-2);
+  border-color: var(--ink-2);
+  color: var(--ink);
+  font-weight: 600;
+}
+
+/* ---- stat tiles ------------------------------------------------------------ */
+
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 14px;
+  margin-bottom: 20px;
+}
+
+.tile {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.tile .k {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.tile strong {
+  font-size: 26px;
+  font-weight: 600;
+  font-variant-numeric: normal; /* large standalone value: proportional figures */
+  color: var(--ink);
+}
+
+.tile .s {
+  font-size: 12px;
+  color: var(--ink-2);
+}
+
+/* ---- panels (chart + rank lists) ------------------------------------------- */
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+  margin-bottom: 14px;
+}
+
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+}
+
+.panel-head h3 {
+  font-size: 13px;
+  color: var(--ink-2);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.panel-head small { font-size: 12px; color: var(--muted); }
+
+.legend {
+  display: flex;
+  gap: 14px;
+  font-size: 12px;
+  color: var(--ink-2); /* legend text stays in text tokens — never the series color */
+}
+
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+
+.sw {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+}
+.sw-mcp   { background: var(--series-mcp); }
+.sw-skill { background: var(--series-skill); }
+.sw-tools { background: var(--series-tools); }
+
+#chart svg {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+
+#chart .grid { stroke: var(--grid); stroke-width: 1; }
+#chart .ax   { fill: var(--muted); font-size: 11px; }
+
+#chart rect {
+  stroke: var(--surface);
+  stroke-width: 2px;
+  paint-order: stroke;
+}
+.b-mcp   { fill: var(--series-mcp); }
+.b-skill { fill: var(--series-skill); }
+.b-tools { fill: var(--series-tools); }
+
+/* ---- rank lists ------------------------------------------------------------- */
+
+.ranks {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 14px;
+}
+
+.rank {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.rank li {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 8px;
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  font-size: 13px;
+}
+
+.rank .name {
+  position: relative;
+  color: var(--ink-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rank .n {
+  position: relative;
+  color: var(--ink);
+  font-weight: 600;
+  flex: none;
+}
+
+.mini {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  background: var(--ink);
+  opacity: 0.10;
+  z-index: 0;
+  border-radius: var(--radius-sm);
+}
+#r-mcp .mini   { background: var(--series-mcp); }
+#r-skill .mini { background: var(--series-skill); }
+#r-tools .mini { background: var(--series-tools); }
+
+.rank .empty { padding: 10px 4px; }
+
+/* ---- footer ------------------------------------------------------------------ */
+
+.foot {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 10px 20px 32px;
+  font-size: 12px;
+  color: var(--muted);
+  text-align: right;
+}
+
+/* ---- narrow screens: one column, never horizontal scroll ---------------------- */
+
+@media (max-width: 900px) {
+  .tiles, .ranks, .cards {
+    grid-template-columns: 1fr;
+  }
+  .title { max-width: 60vw; }
+}
