@@ -164,6 +164,34 @@ class TestShouldAlert(unittest.TestCase):
         self.assertFalse(fire)
 
 
+class TestLimitFor(unittest.TestCase):
+    """모델→한도 표는 설정값을 아래로만 조정한다 — 위로 부풀리지 않는다.
+
+    transcript의 model은 `claude-opus-5`처럼 맨 API id로 오고 `[1m]` 여부를
+    알려주지 않는다. 표가 설정값보다 큰 한도를 준다고 믿을 근거가 없으므로
+    상한은 항상 cfg["context_limit"]이다.
+    """
+
+    def test_haiku_under_1m_config_gives_200k(self):
+        cfg = {**CFG, "context_limit": 1_000_000}
+        self.assertEqual(alert.limit_for(cfg, "claude-haiku-4-5"), 200_000)
+
+    def test_opus_under_1m_config_gives_1m(self):
+        cfg = {**CFG, "context_limit": 1_000_000}
+        self.assertEqual(alert.limit_for(cfg, "claude-opus-5"), 1_000_000)
+
+    def test_opus_under_200k_config_is_capped_to_200k(self):
+        """이게 오늘 실패하는 케이스다: opus가 200K 설정을 1M로 부풀린다."""
+        cfg = {**CFG, "context_limit": 200_000}
+        self.assertEqual(alert.limit_for(cfg, "claude-opus-5"), 200_000)
+
+    def test_unknown_model_uses_the_configured_limit_either_way(self):
+        for limit in (200_000, 1_000_000):
+            with self.subTest(limit=limit):
+                cfg = {**CFG, "context_limit": limit}
+                self.assertEqual(alert.limit_for(cfg, "claude-mystery-9"), limit)
+
+
 class TestMessage(unittest.TestCase):
     def test_message_reports_percent_and_remaining(self):
         title, body = alert.message(900_000, CFG)

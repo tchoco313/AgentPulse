@@ -2,6 +2,9 @@
 import contextlib
 import io
 import json
+import os
+import stat
+import time
 import unittest
 from pathlib import Path
 
@@ -137,6 +140,34 @@ class TestValidate(unittest.TestCase):
         p.write_text("{truncated", encoding="utf-8")
         with self.assertRaises(install.InstallError):
             install.read_settings(p)
+
+
+class TestWriteHelper(unittest.TestCase):
+    """_write는 실행 권한만 지킨다 — mtime까지 예전 값으로 되돌리면 안 된다.
+
+    copystat은 atime/mtime도 옮긴다. 그러면 settings.json/statusline.py의
+    내용이 바뀌어도 mtime이 쓰기 전과 바이트 단위로 같아져서, mtime으로
+    변경을 감지하는 쪽이 이 쓰기를 놓친다.
+    """
+
+    def test_write_bumps_mtime_and_keeps_mode(self):
+        d = tmpdir()
+        p = d / "statusline.py"
+        p.write_text("old", encoding="utf-8")
+        os.chmod(p, 0o755)
+
+        old_time = time.time() - 100_000
+        os.utime(p, (old_time, old_time))
+        before_mtime = p.stat().st_mtime
+        before_mode = stat.S_IMODE(p.stat().st_mode)
+
+        install._write(p, "new")
+
+        after_mtime = p.stat().st_mtime
+        after_mode = stat.S_IMODE(p.stat().st_mode)
+        self.assertGreater(after_mtime, before_mtime)
+        self.assertEqual(after_mode, before_mode)
+        self.assertEqual(p.read_text(encoding="utf-8"), "new")
 
 
 class FakeClaudeDir(unittest.TestCase):

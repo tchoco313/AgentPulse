@@ -43,7 +43,13 @@ def active_sessions(sessions, cfg, now=None):
         # settings.json에서 나오는데, `claude --model ...`은 settings.json을
         # 고치지 않는다 — 실측으로 실제 69%인 세션이 카드에 14% "여유"로
         # 떴고 훅도 조용했다. 모르는 모델일 때만 설정값으로 떨어진다.
-        limit = config.limit_for_model(model, cfg["context_limit"])
+        # 표는 설정값을 아래로만 조정한다. transcript의 model은
+        # `claude-opus-5`처럼 맨 API id로 오고 `[1m]`이 붙었는지는 알려주지
+        # 않으므로, 표가 1M로 재도 이 계정이 실제로 1M 창을 쓰는지는 모른다.
+        # 과소평가는 일찍 경고하고, 과대평가는 영원히 경고하지 않는다 — 그래서
+        # 설정값(cfg["context_limit"])은 상한이다.
+        limit = min(config.limit_for_model(model, cfg["context_limit"]),
+                    cfg["context_limit"])
         ratio = None
         if used is not None and limit:
             # 1.0으로 자른다. 한도가 어긋난 트레이스에서 4.400025가 나와

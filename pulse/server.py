@@ -100,6 +100,15 @@ def _handler_class(state, web_dir):
             self.end_headers()
             self.wfile.write(body)
 
+        def do_HEAD(self):
+            # do_GET과 같은 이유로 HEAD도 막는다. 본문이 없어도 상태 코드
+            # 200/403과 Content-Length만으로 페이지 존재·크기를 캐낼 수 있는
+            # 오라클이 된다 — 실측으로 Host: evil.example.com에 HEAD가
+            # 200을 돌려주던 경로다.
+            if not host_allowed(self.headers.get("Host")):
+                return self._json({"error": "forbidden host"}, status=403)
+            return super().do_HEAD()
+
         def do_GET(self):
             # 라우팅보다 먼저. 정적 파일에도 건다 — API만 막으면 리바인딩된
             # 페이지가 대시보드 자체를 실어 나를 수 있다.

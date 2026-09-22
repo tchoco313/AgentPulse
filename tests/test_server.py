@@ -63,6 +63,14 @@ class ServerTestCase(unittest.TestCase):
         with urllib.request.urlopen(req) as r:
             return r.status, r.read().decode("utf-8")
 
+    def head(self, path, host=None):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}{path}", method="HEAD")
+        if host is not None:
+            req.add_unredirected_header("Host", host)
+        with urllib.request.urlopen(req) as r:
+            return r.status
+
 
 class TestApi(ServerTestCase):
     def test_summary_returns_json(self):
@@ -176,6 +184,18 @@ class TestHostHeader(ServerTestCase):
     def test_normal_request_still_works(self):
         self.start()
         self.assertEqual(self.get("/")[0], 200)
+
+    def test_head_with_foreign_host_is_403(self):
+        """do_GET만 막던 시절엔 HEAD가 헤더만으로 존재·크기 오라클이었다."""
+        self.start()
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            self.head("/", host="evil.example.com")
+        self.addCleanup(cm.exception.close)
+        self.assertEqual(cm.exception.code, 403)
+
+    def test_head_with_normal_host_is_200(self):
+        self.start()
+        self.assertEqual(self.head("/"), 200)
 
 
 class TestPortFallback(ServerTestCase):

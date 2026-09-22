@@ -100,9 +100,16 @@ def limit_for(cfg, model):
 
     import를 함수 안에서 한다 — 모듈 최상단에서 하면 pulse를 못 찾을 때
     import 단계에서 죽고, 아래의 '무슨 일이 있어도 exit 0' 보호막 밖이다.
+
+    표는 설정값을 아래로만 조정한다 — 위로 부풀리지 않는다. transcript의
+    model은 `claude-opus-5`처럼 맨 API id로 오고 `[1m]`이 붙었는지는
+    알려주지 않으므로, 표가 1M로 재도 이 계정이 실제로 1M 창을 쓰는지는
+    표만으로 알 수 없다. 과소평가는 일찍 경고하고, 과대평가는 영원히
+    경고하지 않는다 — 그래서 설정값(cfg["context_limit"])은 상한이다.
     """
     from pulse import config
-    return config.limit_for_model(model, cfg["context_limit"])
+    return min(config.limit_for_model(model, cfg["context_limit"]),
+               cfg["context_limit"])
 
 
 def should_alert(payload, cfg, seen, used, model=None):

@@ -153,7 +153,11 @@ def _write(path, text):
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
         if path.exists():
-            shutil.copystat(path, tmp)  # 실행 권한(statusline.py)을 지킨다
+            # 실행 권한(statusline.py)만 지킨다. copystat은 atime/mtime까지
+            # 옮겨 쓰기 전 값 그대로 만들어버린다 — 그러면 내용이 바뀌었는데도
+            # mtime이 똑같아서, mtime으로 변경을 감지하는 쪽(예: settings.json을
+            # 지켜보는 도구)이 이 쓰기를 놓친다.
+            shutil.copymode(path, tmp)
         os.replace(tmp, path)
     except BaseException:
         try:

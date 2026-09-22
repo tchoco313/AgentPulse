@@ -125,5 +125,45 @@ class TestActiveSessions(unittest.TestCase):
         self.assertEqual(live.active_sessions(sessions, CFG, now=self.now), [])
 
 
+class TestConfiguredLimitIsACeiling(unittest.TestCase):
+    """모델→한도 표는 설정값을 아래로만 조정한다 — 위로 부풀리지 않는다.
+
+    트랜스크립트의 model은 `claude-opus-5`처럼 맨 API id다. `[1m]`이 붙었는지는
+    알 수 없으므로, 표가 실제보다 큰 한도를 준다고 믿을 근거가 없다. 과소평가는
+    일찍 경고하고, 과대평가는 영원히 경고하지 않는다 — 그래서 상한은 항상
+    설정값(cfg["context_limit"])이다.
+    """
+
+    def setUp(self):
+        self.now = datetime(2026, 9, 22, 10, 0, tzinfo=timezone.utc)
+
+    def _limit(self, model, cfg):
+        sessions = {"s1": {"title": "작업", "cwd": "/x", "model": model,
+                           "last_ts": iso(self.now - timedelta(minutes=1)),
+                           "last_ctx": 1000}}
+        return live.active_sessions(sessions, cfg, now=self.now)[0]["limit"]
+
+    def test_haiku_under_1m_config_gives_200k(self):
+        cfg = {**CFG, "context_limit": 1_000_000}
+        self.assertEqual(self._limit("claude-haiku-4-5", cfg), 200_000)
+
+    def test_opus_under_1m_config_gives_1m(self):
+        cfg = {**CFG, "context_limit": 1_000_000}
+        self.assertEqual(self._limit("claude-opus-5", cfg), 1_000_000)
+
+    def test_opus_under_200k_config_is_capped_to_200k(self):
+        """실패 사례: 190K/200K(95%, danger)인 세션이 opus 테이블값 1M로
+        재지면 19% "여유"로 뜨고 Stop 훅도 조용하다 — 이 매핑이 막으려던
+        바로 그 실패가 반대 방향으로 재현된 것이다."""
+        cfg = {**CFG, "context_limit": 200_000}
+        self.assertEqual(self._limit("claude-opus-5", cfg), 200_000)
+
+    def test_unknown_model_uses_the_configured_limit_either_way(self):
+        for limit in (200_000, 1_000_000):
+            with self.subTest(limit=limit):
+                cfg = {**CFG, "context_limit": limit}
+                self.assertEqual(self._limit("claude-mystery-9", cfg), limit)
+
+
 if __name__ == "__main__":
     unittest.main()
