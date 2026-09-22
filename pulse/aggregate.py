@@ -1,0 +1,197 @@
+"""이벤트 -> 부분집계(fold) -> 기간 집계(merge).
+
+순수 함수만 있다. 파일 시스템을 모른다.
+"""
+from datetime import datetime
+
+GROUPS = ("mcp", "skill", "tools")
+
+
+def classify_tool(name, skill):
+    """도구 이름을 (그룹, 표시 라벨)로 나눈다."""
+    if name.startswith("mcp__"):
+        parts = name.split("__")
+        if len(parts) >= 3 and parts[1]:
+            return "mcp", parts[1]
+        return "tools", name
+    if name == "Skill":
+        return "skill", skill or "(미상)"
+    return "tools", name
+
+
+def local_day(ts):
+    """UTC ISO 문자열 -> 로컬 타임존의 YYYY-MM-DD.
+
+    사용자가 보는 '하루'는 로컬 날짜다. UTC로 버킷하면 KST 오전 작업이
+    전날로 밀린다.
+    """
+    if not ts:
+        return ""
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    return dt.astimezone().strftime("%Y-%m-%d")
+
+
+def empty_partial():
+    return {"days": {}, "tools": {g: {} for g in GROUPS},
+            "compacts": [], "sessions": {}, "bad_lines": 0}
+
+
+def _day_bucket(partial, day):
+    return partial["days"].setdefault(day, {
+        "input": 0, "output": 0, "cache_read": 0, "cache_creation": 0,
+        "calls": {g: 0 for g in GROUPS},
+    })
+
+
+def _session(partial, sid):
+    return partial["sessions"].setdefault(sid, {
+        "title": None, "cwd": "", "model": "", "last_ts": "", "last_ctx": None,
+        "sub": False,
+    })
+
+
+def fold(events, partial=None, subagent=False):
+    """이벤트들을 부분집계에 접어 넣는다. partial을 주면 그 위에 누적한다.
+
+    subagent=True는 서브에이전트 트랜스크립트에서 온 이벤트라는 뜻이다. 사용량
+    총계에는 들어가지만 실시간 세션 카드에서는 빠진다 — 사용자가 알고 싶은 것은
+    자기 세션이 언제 압축되는가이고, 서브에이전트 컨텍스트는 손쓸 대상이 아니다.
+    """
+    p = empty_partial() if partial is None else partial
+
+    for e in events:
+        kind = e.get("kind")
+        sid = e.get("session") or ""
+        if subagent and sid:
+            _session(p, sid)["sub"] = True
+
+        if kind == "usage":
+            day = local_day(e["ts"])
+            if day:
+                b = _day_bucket(p, day)
+                for k in ("input", "output", "cache_read", "cache_creation"):
+                    b[k] += e.get(k, 0)
+            s = _session(p, sid)
+            if e["ts"] >= s["last_ts"]:
+                s["last_ts"] = e["ts"]
+                s["last_ctx"] = (e.get("input", 0) + e.get("cache_read", 0)
+                                 + e.get("cache_creation", 0))
+                s["cwd"] = e.get("cwd") or s["cwd"]
+                s["model"] = e.get("model") or s["model"]
+
+        elif kind == "tool":
+            group, label = classify_tool(e.get("name") or "", e.get("skill"))
+            p["tools"][group][label] = p["tools"][group].get(label, 0) + 1
+            day = local_day(e["ts"])
+            if day:
+                _day_bucket(p, day)["calls"][group] += 1
+
+        elif kind == "compact":
+            pre, post = e.get("pre", 0), e.get("post", 0)
+            p["compacts"].append({
+                "ts": e["ts"], "day": local_day(e["ts"]),
+                "trigger": e.get("trigger") or "unknown",
+                "pre": pre, "post": post, "dropped": max(0, pre - post),
+            })
+
+        elif kind == "title":
+            _session(p, sid)["title"] = e.get("title") or None
+
+        elif kind == "activity":
+            s = _session(p, sid)
+            if e["ts"] >= s["last_ts"]:
+                s["last_ts"] = e["ts"]
+
+    return p
+
+
+def _merge_sessions(target, incoming):
+    for sid, s in incoming.items():
+        cur = target.get(sid)
+        if cur is None:
+            target[sid] = dict(s)
+            continue
+        # 제목은 한 번이라도 붙었으면 유지
+        if s.get("title") and not cur.get("title"):
+            cur["title"] = s["title"]
+        if s.get("sub"):
+            cur["sub"] = True  # 한 번이라도 서브에이전트면 서브에이전트다
+        if s.get("last_ts", "") >= cur.get("last_ts", ""):
+            cur["last_ts"] = s["last_ts"]
+            if s.get("last_ctx") is not None:
+                cur["last_ctx"] = s["last_ctx"]
+            cur["cwd"] = s.get("cwd") or cur.get("cwd", "")
+            cur["model"] = s.get("model") or cur.get("model", "")
+
+
+def merge(partials, since=None):
+    """부분집계들을 기간(since 이상)으로 걸러 합친다."""
+    days = {}
+    tools = {g: {} for g in GROUPS}
+    compacts = []
+    sessions = {}
+    bad_lines = 0
+
+    for p in partials:
+        bad_lines += p.get("bad_lines", 0)
+        _merge_sessions(sessions, p.get("sessions", {}))
+
+        for day, b in p.get("days", {}).items():
+            if since and day < since:
+                continue
+            t = days.setdefault(day, {
+                "input": 0, "output": 0, "cache_read": 0, "cache_creation": 0,
+                "calls": {g: 0 for g in GROUPS},
+            })
+            for k in ("input", "output", "cache_read", "cache_creation"):
+                t[k] += b.get(k, 0)
+            for g in GROUPS:
+                t["calls"][g] += (b.get("calls") or {}).get(g, 0)
+
+        for c in p.get("compacts", []):
+            if since and c.get("day", "") < since:
+                continue
+            compacts.append(c)
+
+    # 기간 필터가 도구 순위에도 걸려야 하므로, 일별 호출 수에서 그룹 총합을 내고
+    # 라벨별 세부는 기간 필터가 없을 때만 정확하다. 기간이 걸린 경우를 위해
+    # 라벨별 집계도 일자와 함께 보관해야 정확하지만, 부분집계 크기를 감당하기
+    # 위해 라벨별은 파일 단위로만 나눈다. 따라서 since가 있으면 라벨 순위는
+    # 그 기간에 활동이 있던 파일들의 전체 라벨 집계다 -- UI에 그렇게 표기한다.
+    for p in partials:
+        for g in GROUPS:
+            for label, n in (p.get("tools", {}).get(g) or {}).items():
+                tools[g][label] = tools[g].get(label, 0) + n
+
+    total_calls = sum(sum(d["calls"].values()) for d in days.values())
+    totals = {k: sum(d[k] for d in days.values())
+              for k in ("input", "output", "cache_read", "cache_creation")}
+    totals["total"] = sum(totals.values())
+    totals["calls"] = total_calls
+    totals["cache_read_ratio"] = (
+        totals["cache_read"] / totals["total"] if totals["total"] else 0.0
+    )
+
+    dropped_total = sum(c["dropped"] for c in compacts)
+    compact_stats = {
+        "count": len(compacts),
+        "auto": sum(1 for c in compacts if c["trigger"] == "auto"),
+        "manual": sum(1 for c in compacts if c["trigger"] != "auto"),
+        "dropped_total": dropped_total,
+        "dropped_avg": dropped_total // len(compacts) if compacts else 0,
+    }
+
+    return {
+        "days": [dict(day=d, total=sum(v[k] for k in
+                      ("input", "output", "cache_read", "cache_creation")), **v)
+                 for d, v in sorted(days.items())],
+        "totals": totals,
+        "tools": {g: sorted(([label, n] for label, n in tools[g].items()),
+                            key=lambda x: (-x[1], x[0])) for g in GROUPS},
+        "compacts": compact_stats,
+        "sessions": sessions,
+        "bad_lines": bad_lines,
+    }
