@@ -71,10 +71,11 @@ class TestFold(unittest.TestCase):
                       tool("2026-09-22T01:00:00.000Z", "Bash"),
                       tool("2026-09-22T01:00:00.000Z", "mcp__dbhub__execute_sql"),
                       tool("2026-09-22T01:00:00.000Z", "Skill", skill="dataviz")])
-        self.assertEqual(p["tools"]["tools"]["Bash"], 2)
-        self.assertEqual(p["tools"]["mcp"]["dbhub"], 1)
-        self.assertEqual(p["tools"]["skill"]["dataviz"], 1)
         day = agg.local_day("2026-09-22T01:00:00.000Z")
+        labels = p["days"][day]["labels"]
+        self.assertEqual(labels["tools"]["Bash"], 2)
+        self.assertEqual(labels["mcp"]["dbhub"], 1)
+        self.assertEqual(labels["skill"]["dataviz"], 1)
         self.assertEqual(p["days"][day]["calls"],
                          {"mcp": 1, "skill": 1, "tools": 2})
 
@@ -177,6 +178,29 @@ class TestMerge(unittest.TestCase):
         self.assertEqual([d["day"] for d in s["days"]], [d22])
         self.assertEqual(s["totals"]["input"], 7)
         self.assertNotIn(d20, [d["day"] for d in s["days"]])
+
+    def test_since_filters_tool_ranking_too(self):
+        """기간 탭을 바꿨는데 순위만 전체 기간이면 조용히 틀린 숫자가 된다."""
+        d22 = agg.local_day("2026-09-22T01:00:00.000Z")
+        p = agg.fold([tool("2026-09-20T01:00:00.000Z", "OldTool"),
+                      tool("2026-09-22T01:00:00.000Z", "NewTool")])
+
+        s = agg.merge([p], since=d22)
+
+        self.assertEqual(s["tools"]["tools"], [["NewTool", 1]])
+        self.assertEqual(s["totals"]["calls"], 1)
+
+    def test_calls_total_matches_ranking_sum_under_since(self):
+        d22 = agg.local_day("2026-09-22T01:00:00.000Z")
+        p = agg.fold([tool("2026-09-20T01:00:00.000Z", "Bash"),
+                      tool("2026-09-22T01:00:00.000Z", "Bash"),
+                      tool("2026-09-22T01:00:00.000Z", "mcp__dbhub__execute_sql")])
+
+        s = agg.merge([p], since=d22)
+
+        ranked = sum(n for g in ("mcp", "skill", "tools")
+                     for _, n in s["tools"][g])
+        self.assertEqual(ranked, s["totals"]["calls"])
 
     def test_tools_ranked_descending(self):
         s = agg.merge([agg.fold([tool("2026-09-22T01:00:00.000Z", "Read"),
