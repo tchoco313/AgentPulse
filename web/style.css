@@ -27,6 +27,10 @@
   --status-caution: #fab219;
   --status-danger:  #d03b3b;
 
+  /* "unknown" is the absence of a reading, not a level on the ok/caution/danger
+     scale and not an entity on the categorical scale — neutral grey, its own slot */
+  --status-unknown: #7a7a76;
+
   --radius: 10px;
   --radius-sm: 6px;
 }
@@ -139,6 +143,7 @@ h1, h2, h3 { margin: 0; font-weight: 600; }
 .card.ok      { border-color: rgba(12, 163, 12, 0.35); }
 .card.caution { border-color: var(--status-caution); }
 .card.danger  { border-color: var(--status-danger); }
+.card.unknown { border-color: var(--status-unknown); }
 
 .card-top {
   display: flex;
@@ -187,6 +192,7 @@ h1, h2, h3 { margin: 0; font-weight: 600; }
 }
 .card.caution .bar-fill { background: var(--status-caution); }
 .card.danger  .bar-fill { background: var(--status-danger); }
+.card.unknown .bar-fill { background: var(--status-unknown); }
 
 .bar-mark {
   position: absolute;
@@ -225,6 +231,7 @@ h1, h2, h3 { margin: 0; font-weight: 600; }
 }
 .card.caution .badge { color: var(--status-caution); }
 .card.danger  .badge { color: var(--status-danger); }
+.card.unknown .badge { color: var(--status-unknown); }
 
 .empty {
   color: var(--muted);

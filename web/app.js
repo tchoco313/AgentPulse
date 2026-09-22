@@ -5,7 +5,9 @@ const $ = (id) => document.getElementById(id);
 
 // ---- 포맷 ----------------------------------------------------------------
 function human(n) {
+  // 누적 처리 토큰은 실측 50억대까지 간다. B 단위가 없으면 "5013.6M"이 된다.
   if (n === null || n === undefined) return "–";
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + "B";
   if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
   if (n >= 1e3) return Math.round(n / 1e3) + "K";
   return String(n);
@@ -31,7 +33,7 @@ function renderSessions(data) {
   box.innerHTML = data.sessions.map((s) => {
     const width = Math.min(100, (s.ratio ?? 0) * 100);
     return `
-      <article class="card ${s.status}">
+      <article class="card ${escape_(s.status)}">
         <div class="card-top">
           <div>
             <div class="title">${escape_(s.title)}</div>
@@ -151,8 +153,10 @@ async function get(path) {
   return r.json();
 }
 
-async function tickLive() {
-  if (document.hidden) return;          // 배경 탭에서는 쉰다
+async function tickLive({ force = false } = {}) {
+  // 배경 탭에서는 쉰다. 다만 첫 렌더는 예외 — 안 그러면 배경 탭에서 연 사용자는
+  // 빈 상태 문구조차 없는 빈 영역을 보게 된다.
+  if (document.hidden && !force) return;
   try { renderSessions(await get("/api/live")); setConn(true); }
   catch { setConn(false); }             // 화면은 그대로 둔다
 }
@@ -173,5 +177,5 @@ $("range-tabs").addEventListener("click", (e) => {
 document.addEventListener("visibilitychange", () => { if (!document.hidden) tickLive(); });
 
 loadSummary();
-tickLive();
-setInterval(tickLive, POLL_MS);
+tickLive({ force: true });
+setInterval(() => tickLive(), POLL_MS);
