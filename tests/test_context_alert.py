@@ -68,9 +68,16 @@ class TestMessage(unittest.TestCase):
 
 class TestScriptNeverFails(unittest.TestCase):
     def run_script(self, stdin_text, alerted_path, cwd=None):
+        """설정 경로도 주입한다 — 안 그러면 실제 ~/.claude를 읽는다."""
+        d = Path(tempfile.mkdtemp())
+        settings = d / "settings.json"
+        settings.write_text(json.dumps({"model": "opus[1m]"}), encoding="utf-8")
         return subprocess.run(
             [sys.executable, str(ROOT / "hooks" / "context_alert.py"),
-             "--alerted-path", str(alerted_path), "--dry-run"],
+             "--alerted-path", str(alerted_path),
+             "--config-path", str(d / "absent.json"),
+             "--settings-path", str(settings),
+             "--dry-run"],
             input=stdin_text, text=True, capture_output=True,
             cwd=cwd or ROOT,
         )
@@ -108,6 +115,13 @@ class TestScriptNeverFails(unittest.TestCase):
         r = self.run_script(json.dumps(payload(pct=99.0)),
                             "/nonexistent-root/alerted.json")
         self.assertEqual(r.returncode, 0)
+
+    def test_unwritable_alerted_path_does_not_alert_every_turn(self):
+        """기록이 안 되면 조용히 넘어간다. 턴마다 울리는 알림이 더 나쁘다."""
+        outs = [self.run_script(json.dumps(payload(pct=99.0)),
+                                "/nonexistent-root/alerted.json").stdout
+                for _ in range(3)]
+        self.assertEqual(outs, ["", "", ""])
 
 
 if __name__ == "__main__":

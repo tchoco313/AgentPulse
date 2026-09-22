@@ -65,6 +65,9 @@ def _notify(title, body):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--alerted-path", default=str(DEFAULT_ALERTED_PATH))
+    # 설정 경로도 주입할 수 있어야 테스트가 실제 ~/.claude를 읽지 않는다.
+    ap.add_argument("--config-path", default=None)
+    ap.add_argument("--settings-path", default=None)
     ap.add_argument("--dry-run", action="store_true",
                     help="알림을 띄우는 대신 표준출력에 찍는다 (테스트용)")
     args = ap.parse_args()
@@ -72,7 +75,8 @@ def main():
     from pulse import config
 
     payload = json.loads(sys.stdin.read())
-    cfg = config.load_config()
+    cfg = config.load_config(config_path=args.config_path,
+                             settings_path=args.settings_path)
 
     alerted_path = Path(args.alerted_path)
     try:
@@ -86,19 +90,24 @@ def main():
     if not fire:
         return
 
+    # 기록이 먼저다. 알린 뒤에 기록하면, 기록이 계속 실패할 때(디스크 가득,
+    # 권한) 매 턴 알림이 다시 뜬다. 턴마다 울리는 알림은 한 번도 안 울리는
+    # 것보다 나쁘다 — 사용자는 그냥 알림을 꺼버린다.
+    alerted_path.parent.mkdir(parents=True, exist_ok=True)
+    alerted_path.write_text(json.dumps(seen), encoding="utf-8")
+
     title, body = message(payload, cfg)
     if args.dry_run:
         print(f"{title}: {body}")
     else:
         _notify(title, body)
 
-    alerted_path.parent.mkdir(parents=True, exist_ok=True)
-    alerted_path.write_text(json.dumps(seen), encoding="utf-8")
-
 
 if __name__ == "__main__":
     try:
         main()
-    except Exception:
-        pass  # 훅은 Claude Code를 절대 막지 않는다
+    except BaseException:
+        # Exception만 잡으면 argparse의 SystemExit이 새어나가 종료코드가 2가 된다.
+        # 훅은 무슨 일이 있어도 Claude Code를 막지 않는다.
+        pass
     sys.exit(0)
