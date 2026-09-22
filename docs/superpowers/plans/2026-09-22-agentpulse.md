@@ -816,8 +816,10 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
   ```python
   {"days": {"2026-09-22": {"input": int, "output": int, "cache_read": int,
                             "cache_creation": int,
-                            "calls": {"mcp": int, "skill": int, "tools": int}}},
-   "tools": {"mcp": {"dbhub": int}, "skill": {"dataviz": int}, "tools": {"Bash": int}},
+                            "calls": {"mcp": int, "skill": int, "tools": int},
+                            "labels": {"mcp": {"dbhub": int},
+                                       "skill": {"dataviz": int},
+                                       "tools": {"Bash": int}}}},
    "compacts": [{"ts": str, "day": str, "trigger": str, "pre": int, "post": int,
                  "dropped": int}],
    "sessions": {"<sid>": {"title": str | None, "cwd": str, "model": str,
@@ -919,10 +921,11 @@ class TestFold(unittest.TestCase):
                       tool("2026-09-22T01:00:00.000Z", "Bash"),
                       tool("2026-09-22T01:00:00.000Z", "mcp__dbhub__execute_sql"),
                       tool("2026-09-22T01:00:00.000Z", "Skill", skill="dataviz")])
-        self.assertEqual(p["tools"]["tools"]["Bash"], 2)
-        self.assertEqual(p["tools"]["mcp"]["dbhub"], 1)
-        self.assertEqual(p["tools"]["skill"]["dataviz"], 1)
         day = agg.local_day("2026-09-22T01:00:00.000Z")
+        labels = p["days"][day]["labels"]
+        self.assertEqual(labels["tools"]["Bash"], 2)
+        self.assertEqual(labels["mcp"]["dbhub"], 1)
+        self.assertEqual(labels["skill"]["dataviz"], 1)
         self.assertEqual(p["days"][day]["calls"],
                          {"mcp": 1, "skill": 1, "tools": 2})
 
@@ -1025,6 +1028,29 @@ class TestMerge(unittest.TestCase):
         self.assertEqual([d["day"] for d in s["days"]], [d22])
         self.assertEqual(s["totals"]["input"], 7)
         self.assertNotIn(d20, [d["day"] for d in s["days"]])
+
+    def test_since_filters_tool_ranking_too(self):
+        """기간 탭을 바꿨는데 순위만 전체 기간이면 조용히 틀린 숫자가 된다."""
+        d22 = agg.local_day("2026-09-22T01:00:00.000Z")
+        p = agg.fold([tool("2026-09-20T01:00:00.000Z", "OldTool"),
+                      tool("2026-09-22T01:00:00.000Z", "NewTool")])
+
+        s = agg.merge([p], since=d22)
+
+        self.assertEqual(s["tools"]["tools"], [["NewTool", 1]])
+        self.assertEqual(s["totals"]["calls"], 1)
+
+    def test_calls_total_matches_ranking_sum_under_since(self):
+        d22 = agg.local_day("2026-09-22T01:00:00.000Z")
+        p = agg.fold([tool("2026-09-20T01:00:00.000Z", "Bash"),
+                      tool("2026-09-22T01:00:00.000Z", "Bash"),
+                      tool("2026-09-22T01:00:00.000Z", "mcp__dbhub__execute_sql")])
+
+        s = agg.merge([p], since=d22)
+
+        ranked = sum(n for g in ("mcp", "skill", "tools")
+                     for _, n in s["tools"][g])
+        self.assertEqual(ranked, s["totals"]["calls"])
 
     def test_tools_ranked_descending(self):
         s = agg.merge([agg.fold([tool("2026-09-22T01:00:00.000Z", "Read"),
@@ -1132,15 +1158,18 @@ def local_day(ts):
 
 
 def empty_partial():
-    return {"days": {}, "tools": {g: {} for g in GROUPS},
-            "compacts": [], "sessions": {}, "bad_lines": 0}
+    return {"days": {}, "compacts": [], "sessions": {}, "bad_lines": 0}
+
+
+def _empty_day():
+    """도구 집계가 날짜 안에 있다 — 기간 필터가 순위에도 걸려야 하기 때문이다."""
+    return {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0,
+            "calls": {g: 0 for g in GROUPS},
+            "labels": {g: {} for g in GROUPS}}
 
 
 def _day_bucket(partial, day):
-    return partial["days"].setdefault(day, {
-        "input": 0, "output": 0, "cache_read": 0, "cache_creation": 0,
-        "calls": {g: 0 for g in GROUPS},
-    })
+    return partial["days"].setdefault(day, _empty_day())
 
 
 def _session(partial, sid):
@@ -1181,10 +1210,11 @@ def fold(events, partial=None, subagent=False):
 
         elif kind == "tool":
             group, label = classify_tool(e.get("name") or "", e.get("skill"))
-            p["tools"][group][label] = p["tools"][group].get(label, 0) + 1
             day = local_day(e["ts"])
             if day:
-                _day_bucket(p, day)["calls"][group] += 1
+                b = _day_bucket(p, day)
+                b["calls"][group] += 1
+                b["labels"][group][label] = b["labels"][group].get(label, 0) + 1
 
         elif kind == "compact":
             pre, post = e.get("pre", 0), e.get("post", 0)
@@ -1239,29 +1269,18 @@ def merge(partials, since=None):
         for day, b in p.get("days", {}).items():
             if since and day < since:
                 continue
-            t = days.setdefault(day, {
-                "input": 0, "output": 0, "cache_read": 0, "cache_creation": 0,
-                "calls": {g: 0 for g in GROUPS},
-            })
+            t = days.setdefault(day, _empty_day())
             for k in ("input", "output", "cache_read", "cache_creation"):
                 t[k] += b.get(k, 0)
             for g in GROUPS:
                 t["calls"][g] += (b.get("calls") or {}).get(g, 0)
+                for label, cnt in ((b.get("labels") or {}).get(g) or {}).items():
+                    tools[g][label] = tools[g].get(label, 0) + cnt
 
         for c in p.get("compacts", []):
             if since and c.get("day", "") < since:
                 continue
             compacts.append(c)
-
-    # 기간 필터가 도구 순위에도 걸려야 하므로, 일별 호출 수에서 그룹 총합을 내고
-    # 라벨별 세부는 기간 필터가 없을 때만 정확하다. 기간이 걸린 경우를 위해
-    # 라벨별 집계도 일자와 함께 보관해야 정확하지만, 부분집계 크기를 감당하기
-    # 위해 라벨별은 파일 단위로만 나눈다. 따라서 since가 있으면 라벨 순위는
-    # 그 기간에 활동이 있던 파일들의 전체 라벨 집계다 -- UI에 그렇게 표기한다.
-    for p in partials:
-        for g in GROUPS:
-            for label, n in (p.get("tools", {}).get(g) or {}).items():
-                tools[g][label] = tools[g].get(label, 0) + n
 
     total_calls = sum(sum(d["calls"].values()) for d in days.values())
     totals = {k: sum(d[k] for d in days.values())
@@ -1282,8 +1301,11 @@ def merge(partials, since=None):
     }
 
     return {
-        "days": [dict(day=d, total=sum(v[k] for k in
-                      ("input", "output", "cache_read", "cache_creation")), **v)
+        "days": [{"day": d,
+                  "total": sum(v[k] for k in ("input", "output",
+                                              "cache_read", "cache_creation")),
+                  **{k: v[k] for k in ("input", "output", "cache_read",
+                                       "cache_creation", "calls")}}
                  for d, v in sorted(days.items())],
         "totals": totals,
         "tools": {g: sorted(([label, n] for label, n in tools[g].items()),
@@ -1301,7 +1323,7 @@ cd ~/Workspaces/13_AgentPulse
 python3 -m unittest tests.test_aggregate -v
 ```
 
-Expected: PASS — 31 tests
+Expected: PASS — 32 tests
 
 - [ ] **Step 5: 커밋**
 
