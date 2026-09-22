@@ -3277,6 +3277,38 @@ echo '{"model":{"display_name":"Opus 5"},"workspace":{"current_dir":"/Users/teo"
 
 Expected: 첫 줄은 `ctx 36%`가 평소대로, 둘째 줄은 `⚠ ctx 91%(90K 남음)`. 예외 없음.
 
+- [ ] **Step 3.5: 실제 훅 payload의 필드 이름을 확인한다**
+
+훅은 지금까지 합성 payload로만 테스트됐다. Claude Code가 Stop 훅에 실제로 무엇을
+주는지 확인하지 않고 등록하면, 필드 이름이 다를 경우 훅이 예외를 삼키고 조용히
+아무것도 안 한다 — 테스트는 전부 통과한 채로.
+
+먼저 캡처용 훅을 임시로 등록한다. `hooks.Stop[0].hooks` 배열에 추가:
+
+```json
+{ "type": "command",
+  "command": "cat > /tmp/pulse-hook-payload.json",
+  "async": true }
+```
+
+한 턴이 지난 뒤 확인한다:
+
+```bash
+python3 -c "
+import json
+d = json.load(open('/tmp/pulse-hook-payload.json'))
+print('최상위 키:', sorted(d))
+print('session_id 있나:', 'session_id' in d)
+cw = d.get('context_window')
+print('context_window:', json.dumps(cw, ensure_ascii=False) if cw else '없음')
+"
+```
+
+Expected: `session_id`가 있고, `context_window.used_percentage`가 숫자다.
+**다르면 멈추고 보고한다** — `hooks/context_alert.py`의 `should_alert`와
+`message`가 읽는 키를 실제 이름에 맞춰야 한다. 확인이 끝나면 캡처용 훅 항목을
+지우고 `/tmp/pulse-hook-payload.json`도 지운다.
+
 - [ ] **Step 4: Stop 훅을 등록한다**
 
 `~/.claude/settings.json`의 `hooks.Stop[0].hooks` 배열에 항목을 **추가**한다. 기존 `afplay` 항목은 지우지 않는다. 결과는 이렇게 된다:
