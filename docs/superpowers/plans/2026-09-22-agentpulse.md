@@ -403,12 +403,16 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 
   ```python
   {"kind": "usage", "ts": str, "session": str, "cwd": str, "model": str,
-   "input": int, "output": int, "cache_read": int, "cache_creation": int}
-  {"kind": "tool", "ts": str, "session": str, "name": str, "skill": str | None}
+   "input": int, "output": int, "cache_read": int, "cache_creation": int, "sub": bool}
+  {"kind": "tool", "ts": str, "session": str, "name": str, "skill": str | None, "sub": bool}
   {"kind": "compact", "ts": str, "session": str, "trigger": str, "pre": int, "post": int}
   {"kind": "title", "session": str, "title": str}
-  {"kind": "activity", "ts": str, "session": str}
+  {"kind": "activity", "ts": str, "session": str, "sub": bool}
   ```
+
+  `sub`는 그 레코드의 `isSidechain`이다. 서브에이전트 트랜스크립트는 **부모와 같은
+  `sessionId`를 쓰므로**, 세션을 구분하는 유일한 신호가 이 필드다. 파일 경로로
+  판단하면 부모 세션까지 서브에이전트로 물들어 실시간 카드에서 사라진다(실측).
 
   `ts`는 트랜스크립트 원문 그대로의 ISO 문자열(예: `"2026-09-22T01:37:49.879Z"`)이다.
 
@@ -426,7 +430,8 @@ from pulse import scan
 
 
 def assistant_line(ts="2026-09-22T01:00:00.000Z", session="s1", usage=None,
-                   model="claude-opus-5", tools=(), cwd="/Users/teo"):
+                   model="claude-opus-5", tools=(), cwd="/Users/teo",
+                   sidechain=False):
     content = [{"type": "text", "text": "hi"}]
     for name, inp in tools:
         content.append({"type": "tool_use", "id": "t", "name": name, "input": inp})
@@ -435,7 +440,7 @@ def assistant_line(ts="2026-09-22T01:00:00.000Z", session="s1", usage=None,
         msg["usage"] = usage
     return json.dumps({
         "type": "assistant", "timestamp": ts, "sessionId": session,
-        "cwd": cwd, "message": msg,
+        "cwd": cwd, "isSidechain": sidechain, "message": msg,
     })
 
 
@@ -472,6 +477,17 @@ class TestParseLine(unittest.TestCase):
         self.assertEqual([t["name"] for t in tools], ["Bash", "Skill"])
         self.assertIsNone(tools[0]["skill"])
         self.assertEqual(tools[1]["skill"], "dataviz")
+
+    def test_sidechain_records_are_marked(self):
+        # 서브에이전트 트랜스크립트는 부모와 같은 sessionId를 쓴다.
+        # isSidechain만이 둘을 가르는 신호다.
+        ev = scan.parse_line(assistant_line(usage={}, sidechain=True,
+                                            tools=[("Bash", {})]))
+        self.assertTrue(all(e["sub"] for e in ev))
+
+    def test_non_sidechain_records_are_not_marked(self):
+        ev = scan.parse_line(assistant_line(usage={}, tools=[("Bash", {})]))
+        self.assertFalse(any(e["sub"] for e in ev))
 
     def test_compact_boundary(self):
         line = json.dumps({
@@ -685,6 +701,8 @@ def parse_line(line):
     session = d.get("sessionId") or ""
     ts = d.get("timestamp") or ""
 
+    sub = bool(d.get("isSidechain"))
+
     if kind == "assistant":
         msg = d.get("message") or {}
         usage = msg.get("usage") or {}
@@ -695,6 +713,7 @@ def parse_line(line):
             "output": _int(usage, "output_tokens"),
             "cache_read": _int(usage, "cache_read_input_tokens"),
             "cache_creation": _int(usage, "cache_creation_input_tokens"),
+            "sub": sub,
         }]
         for block in msg.get("content") or []:
             if isinstance(block, dict) and block.get("type") == "tool_use":
@@ -704,6 +723,7 @@ def parse_line(line):
                     "kind": "tool", "ts": ts, "session": session,
                     "name": block.get("name") or "",
                     "skill": skill if isinstance(skill, str) else None,
+                    "sub": sub,
                 })
         return events
 
@@ -720,7 +740,7 @@ def parse_line(line):
                  "title": d.get("aiTitle") or ""}]
 
     if kind == "user":
-        return [{"kind": "activity", "ts": ts, "session": session}]
+        return [{"kind": "activity", "ts": ts, "session": session, "sub": sub}]
 
     return None
 
@@ -764,7 +784,7 @@ cd ~/Workspaces/13_AgentPulse
 python3 -m unittest tests.test_scan -v
 ```
 
-Expected: PASS — 20 tests
+Expected: PASS — 22 tests
 
 - [ ] **Step 5: 실제 데이터로 한 번 돌려본다**
 
@@ -807,8 +827,11 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
     반환 `(group, label)`, group은 `"mcp" | "skill" | "tools"` 중 하나
   - `pulse.aggregate.local_day(ts: str) -> str` — `"YYYY-MM-DD"`, 로컬 타임존 기준
   - `pulse.aggregate.empty_partial() -> dict`
-  - `pulse.aggregate.fold(events, partial=None, subagent=False) -> dict`
-    `subagent=True`면 이 파일에서 본 세션에 `"sub": True`를 심는다.
+  - `pulse.aggregate.fold(events, partial=None) -> dict`
+    `sub`가 참인 이벤트의 토큰·호출은 일별 집계에 **들어가지만**, 세션의
+    `last_ts`/`last_ctx`는 갱신하지 않는다. 서브에이전트는 부모와 세션 id를
+    공유하므로, 갱신하면 실시간 카드가 서브에이전트의 컨텍스트를 사용자 것으로
+    표시한다(실측 432,769 — 사용자 실제값이 아니었다).
   - `pulse.aggregate.merge(partials: list[dict], since: str | None = None) -> dict`
 
   **partial 형태:**
@@ -823,7 +846,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
    "compacts": [{"ts": str, "day": str, "trigger": str, "pre": int, "post": int,
                  "dropped": int}],
    "sessions": {"<sid>": {"title": str | None, "cwd": str, "model": str,
-                          "last_ts": str, "last_ctx": int | None, "sub": bool}},
+                          "last_ts": str, "last_ctx": int | None}},
    "bad_lines": int}
   ```
 
@@ -857,13 +880,14 @@ from pulse import aggregate as agg
 def usage(ts, session="s1", **kw):
     e = {"kind": "usage", "ts": ts, "session": session, "cwd": "/Users/teo",
          "model": "claude-opus-5", "input": 0, "output": 0,
-         "cache_read": 0, "cache_creation": 0}
+         "cache_read": 0, "cache_creation": 0, "sub": False}
     e.update(kw)
     return e
 
 
-def tool(ts, name, skill=None, session="s1"):
-    return {"kind": "tool", "ts": ts, "session": session, "name": name, "skill": skill}
+def tool(ts, name, skill=None, session="s1", sub=False):
+    return {"kind": "tool", "ts": ts, "session": session, "name": name,
+            "skill": skill, "sub": sub}
 
 
 class TestClassifyTool(unittest.TestCase):
@@ -958,13 +982,32 @@ class TestFold(unittest.TestCase):
         self.assertEqual(p["sessions"]["s1"]["last_ts"], "2026-09-22T02:00:00.000Z")
         self.assertEqual(p["sessions"]["s1"]["last_ctx"], 502)
 
-    def test_subagent_flag_marks_sessions(self):
-        p = agg.fold([usage("2026-09-22T01:00:00.000Z", input=1)], subagent=True)
-        self.assertTrue(p["sessions"]["s1"]["sub"])
+    def test_sidechain_tokens_count_but_do_not_move_session_state(self):
+        # 서브에이전트는 부모와 같은 sessionId를 쓴다. 토큰은 사용자가 쓴 것이
+        # 맞지만, 컨텍스트 점유는 부모 것이 아니다.
+        p = agg.fold([
+            usage("2026-09-22T01:00:00.000Z", input=1, cache_read=100),
+            usage("2026-09-22T02:00:00.000Z", input=5, cache_read=900, sub=True),
+        ])
+        day = agg.local_day("2026-09-22T01:00:00.000Z")
+        self.assertEqual(p["days"][day]["input"], 6)          # 토큰은 다 센다
+        self.assertEqual(p["sessions"]["s1"]["last_ctx"], 101)  # 사용자 값 유지
+        self.assertEqual(p["sessions"]["s1"]["last_ts"],
+                         "2026-09-22T01:00:00.000Z")
 
-    def test_default_is_not_subagent(self):
-        p = agg.fold([usage("2026-09-22T01:00:00.000Z", input=1)])
-        self.assertFalse(p["sessions"]["s1"]["sub"])
+    def test_sidechain_activity_does_not_move_last_ts(self):
+        p = agg.fold([
+            usage("2026-09-22T01:00:00.000Z", input=1),
+            {"kind": "activity", "ts": "2026-09-22T05:00:00.000Z",
+             "session": "s1", "sub": True},
+        ])
+        self.assertEqual(p["sessions"]["s1"]["last_ts"],
+                         "2026-09-22T01:00:00.000Z")
+
+    def test_sidechain_tool_calls_count_in_ranking(self):
+        p = agg.fold([tool("2026-09-22T01:00:00.000Z", "Bash", sub=True)])
+        day = agg.local_day("2026-09-22T01:00:00.000Z")
+        self.assertEqual(p["days"][day]["labels"]["tools"]["Bash"], 1)
 
     def test_title_event_names_session(self):
         p = agg.fold([{"kind": "title", "session": "s1", "title": "제목"}])
@@ -1073,16 +1116,15 @@ class TestMerge(unittest.TestCase):
         self.assertEqual(s["sessions"]["s1"]["last_ctx"], 901)
         self.assertEqual(s["totals"]["input"], 2)
 
-    def test_subagent_flag_survives_merge_and_tokens_still_count(self):
-        sub = agg.fold([usage("2026-09-22T01:00:00.000Z", session="a", input=7)],
-                       subagent=True)
-        main = agg.fold([usage("2026-09-22T01:00:00.000Z", session="b", input=3)])
+    def test_sidechain_tokens_survive_merge(self):
+        a = agg.fold([usage("2026-09-22T01:00:00.000Z", session="s1", input=7,
+                            sub=True)])
+        b = agg.fold([usage("2026-09-22T01:00:00.000Z", session="s1", input=3)])
 
-        s = agg.merge([sub, main])
+        s = agg.merge([a, b])
 
-        self.assertTrue(s["sessions"]["a"]["sub"])
-        self.assertFalse(s["sessions"]["b"]["sub"])
-        self.assertEqual(s["totals"]["input"], 10)  # 총계에는 둘 다 들어간다
+        self.assertEqual(s["totals"]["input"], 10)   # 총계에는 둘 다
+        self.assertEqual(s["sessions"]["s1"]["last_ctx"], 3)  # 카드는 부모 것만
 
     def test_compact_stats(self):
         s = agg.merge([agg.fold([
@@ -1175,24 +1217,22 @@ def _day_bucket(partial, day):
 def _session(partial, sid):
     return partial["sessions"].setdefault(sid, {
         "title": None, "cwd": "", "model": "", "last_ts": "", "last_ctx": None,
-        "sub": False,
     })
 
 
-def fold(events, partial=None, subagent=False):
+def fold(events, partial=None):
     """이벤트들을 부분집계에 접어 넣는다. partial을 주면 그 위에 누적한다.
 
-    subagent=True는 서브에이전트 트랜스크립트에서 온 이벤트라는 뜻이다. 사용량
-    총계에는 들어가지만 실시간 세션 카드에서는 빠진다 — 사용자가 알고 싶은 것은
-    자기 세션이 언제 압축되는가이고, 서브에이전트 컨텍스트는 손쓸 대상이 아니다.
+    `sub`가 참인 이벤트(서브에이전트)의 토큰과 도구 호출은 일별 집계에 들어간다 —
+    실제로 쓴 토큰이다. 다만 세션 상태(last_ts/last_ctx)는 갱신하지 않는다.
+    서브에이전트는 부모와 같은 sessionId를 쓰기 때문에, 갱신하면 사용자의 실시간
+    카드가 서브에이전트의 컨텍스트 점유를 사용자 것으로 표시한다.
     """
     p = empty_partial() if partial is None else partial
 
     for e in events:
         kind = e.get("kind")
         sid = e.get("session") or ""
-        if subagent and sid:
-            _session(p, sid)["sub"] = True
 
         if kind == "usage":
             day = local_day(e["ts"])
@@ -1200,6 +1240,8 @@ def fold(events, partial=None, subagent=False):
                 b = _day_bucket(p, day)
                 for k in ("input", "output", "cache_read", "cache_creation"):
                     b[k] += e.get(k, 0)
+            if e.get("sub"):
+                continue  # 토큰은 셌다. 세션 상태는 부모 것이므로 건드리지 않는다
             s = _session(p, sid)
             if e["ts"] >= s["last_ts"]:
                 s["last_ts"] = e["ts"]
@@ -1228,6 +1270,8 @@ def fold(events, partial=None, subagent=False):
             _session(p, sid)["title"] = e.get("title") or None
 
         elif kind == "activity":
+            if e.get("sub"):
+                continue
             s = _session(p, sid)
             if e["ts"] >= s["last_ts"]:
                 s["last_ts"] = e["ts"]
@@ -1244,8 +1288,6 @@ def _merge_sessions(target, incoming):
         # 제목은 한 번이라도 붙었으면 유지
         if s.get("title") and not cur.get("title"):
             cur["title"] = s["title"]
-        if s.get("sub"):
-            cur["sub"] = True  # 한 번이라도 서브에이전트면 서브에이전트다
         if s.get("last_ts", "") >= cur.get("last_ts", ""):
             cur["last_ts"] = s["last_ts"]
             if s.get("last_ctx") is not None:
@@ -1323,7 +1365,7 @@ cd ~/Workspaces/13_AgentPulse
 python3 -m unittest tests.test_aggregate -v
 ```
 
-Expected: PASS — 32 tests
+Expected: PASS — 33 tests
 
 - [ ] **Step 5: 커밋**
 
@@ -1539,7 +1581,6 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
   - `pulse.live.context_status(used: int | None, limit: int, caution: float, warn: float) -> str`
     반환: `"unknown" | "ok" | "caution" | "danger"`
   - `pulse.live.active_sessions(sessions: dict, cfg: dict, now: datetime | None = None) -> list[dict]`
-    `sub`가 참인 세션(서브에이전트 트랜스크립트)은 제외한다.
     반환 항목: `{"session": str, "title": str, "project": str, "model": str,
     "last_ts": str, "used": int | None, "limit": int, "ratio": float | None,
     "status": str}` — `ratio` 내림차순 정렬
@@ -1594,12 +1635,6 @@ class TestActiveSessions(unittest.TestCase):
         self.assertEqual(result[0]["status"], "ok")
         self.assertAlmostEqual(result[0]["ratio"], 0.36)
 
-    def test_subagent_session_is_excluded(self):
-        sessions = {"s1": {"title": "서브", "cwd": "/x", "model": "m",
-                           "last_ts": iso(self.now - timedelta(minutes=1)),
-                           "last_ctx": 100, "sub": True}}
-        self.assertEqual(live.active_sessions(sessions, CFG, now=self.now), [])
-
     def test_old_session_is_excluded(self):
         sessions = {"s1": {"title": "옛날", "cwd": "/x", "model": "m",
                            "last_ts": iso(self.now - timedelta(minutes=60)),
@@ -1637,7 +1672,7 @@ class TestActiveSessions(unittest.TestCase):
     def test_naive_now_does_not_raise(self):
         sessions = {"s1": {"title": "작업", "cwd": "/x", "model": "m",
                            "last_ts": iso(self.now - timedelta(minutes=1)),
-                           "last_ctx": 100, "sub": False}}
+                           "last_ctx": 100}}
 
         result = live.active_sessions(sessions, CFG,
                                       now=self.now.replace(tzinfo=None))
@@ -1702,8 +1737,6 @@ def active_sessions(sessions, cfg, now=None):
 
     rows = []
     for sid, s in sessions.items():
-        if s.get("sub"):
-            continue  # 서브에이전트 세션 — 총계에는 있지만 카드에는 안 띄운다
         when = _parse(s.get("last_ts") or "")
         if when is None or when < cutoff:
             continue
@@ -1733,7 +1766,7 @@ cd ~/Workspaces/13_AgentPulse
 python3 -m unittest tests.test_live -v
 ```
 
-Expected: PASS — 13 tests
+Expected: PASS — 12 tests
 
 - [ ] **Step 5: 커밋**
 
@@ -1760,8 +1793,8 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 - Produces:
   - `pulse.pipeline.refresh(projects_root, cache_path) -> tuple[list[dict], dict]`
     반환 `(partials, cache)` — `partials`는 모든 파일의 부분집계 리스트.
-    경로에 `/subagents/`가 들어간 파일은 `fold(..., subagent=True)`로 접는다.
-  - `pulse.pipeline.is_subagent(path: str) -> bool`
+    서브에이전트 구분은 경로가 아니라 레코드의 `isSidechain`으로 하며, 그 처리는
+    `scan`과 `aggregate`가 이미 한다. 파이프라인은 파일 종류를 구분하지 않는다.
   - `pulse.pipeline.since_for(range_key: str, today: str | None = None) -> str | None`
     `"7d" -> 6일 전 날짜`, `"30d" -> 29일 전`, `"all" -> None`
 
@@ -1779,10 +1812,10 @@ from pulse import aggregate as agg
 from pulse import pipeline
 
 
-def line(ts="2026-09-22T01:00:00.000Z", session="s1", inp=1):
+def line(ts="2026-09-22T01:00:00.000Z", session="s1", inp=1, sidechain=False):
     return json.dumps({
         "type": "assistant", "timestamp": ts, "sessionId": session,
-        "cwd": "/Users/teo",
+        "cwd": "/Users/teo", "isSidechain": sidechain,
         "message": {"role": "assistant", "model": "claude-opus-5", "content": [],
                     "usage": {"input_tokens": inp}},
     })
@@ -1871,19 +1904,22 @@ class TestRefresh(unittest.TestCase):
         self.assertEqual(agg.merge(partials)["totals"]["input"], 10)
         self.assertEqual(len(cache["files"]), 1)
 
-    def test_subagent_transcripts_are_scanned_and_flagged(self):
+    def test_subagent_transcript_counts_but_does_not_move_parent_state(self):
+        # 서브에이전트 파일은 부모와 같은 sessionId를 쓴다(실측).
         sub_dir = self.proj / "sess" / "subagents"
         sub_dir.mkdir(parents=True)
         with open(sub_dir / "agent-x.jsonl", "w", encoding="utf-8") as f:
-            f.write(line(session="subsess", inp=4) + "\n")
-        self.write("a.jsonl", [line(session="mainsess", inp=6)])
+            f.write(line(ts="2026-09-22T05:00:00.000Z", session="s1", inp=4,
+                         sidechain=True) + "\n")
+        self.write("a.jsonl", [line(ts="2026-09-22T01:00:00.000Z",
+                                    session="s1", inp=6)])
 
         partials, _ = pipeline.refresh(self.root / "projects", self.cache_path)
         summary = agg.merge(partials)
 
         self.assertEqual(summary["totals"]["input"], 10)  # 총계에 포함
-        self.assertTrue(summary["sessions"]["subsess"]["sub"])
-        self.assertFalse(summary["sessions"]["mainsess"]["sub"])
+        self.assertEqual(summary["sessions"]["s1"]["last_ts"],
+                         "2026-09-22T01:00:00.000Z")   # 카드는 부모 시각
 
     def test_empty_root_gives_empty_summary(self):
         partials, cache = pipeline.refresh(self.root / "projects", self.cache_path)
@@ -1918,11 +1954,6 @@ from pulse import cache as cache_mod
 from pulse import scan
 
 RANGES = {"7d": 7, "30d": 30}
-
-
-def is_subagent(path):
-    """서브에이전트 트랜스크립트는 <프로젝트>/<세션>/subagents/ 아래에 있다."""
-    return "/subagents/" in str(path)
 
 
 def since_for(range_key, today=None):
@@ -1962,7 +1993,7 @@ def refresh(projects_root, cache_path):
             partial = agg.empty_partial()
 
         events, new_offset, bad = scan.scan_file(path, offset)
-        partial = agg.fold(events, partial, subagent=is_subagent(path))
+        partial = agg.fold(events, partial)
         partial["bad_lines"] = partial.get("bad_lines", 0) + bad
 
         fresh[path] = {"size": st.st_size, "mtime": st.st_mtime,
