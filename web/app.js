@@ -6,9 +6,12 @@ const $ = (id) => document.getElementById(id);
 // ---- 포맷 ----------------------------------------------------------------
 function human(n) {
   // 누적 처리 토큰은 실측 50억대까지 간다. B 단위가 없으면 "5013.6M"이 된다.
+  // 경계는 1e9/1e6/1e3이 아니라 "반올림해서 1000이 되는 값"에 둔다. 1e6에
+  // 두면 999,999가 "1000K", 1e9에 두면 999,999,999가 "1000.0M"이 된다 —
+  // 이 제품이 통째로 보여주려는 바로 그 숫자다.
   if (n === null || n === undefined) return "–";
-  if (n >= 1e9) return (n / 1e9).toFixed(1) + "B";
-  if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+  if (n >= 999.95e6) return (n / 1e9).toFixed(1) + "B";
+  if (n >= 999.5e3) return (n / 1e6).toFixed(1) + "M";
   if (n >= 1e3) return Math.round(n / 1e3) + "K";
   return String(n);
 }

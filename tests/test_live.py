@@ -87,6 +87,38 @@ class TestActiveSessions(unittest.TestCase):
 
         self.assertEqual(len(result), 1)
 
+    def test_session_model_decides_the_limit_not_the_global_config(self):
+        """settings.json이 opus[1m]이어도 haiku로 도는 세션은 200K다.
+
+        실패 사례: `claude --model ...`은 settings.json을 고치지 않는다.
+        전역 한도로 재면 카드가 14% "여유"를 찍는 동안 실제로는 69%였다.
+        """
+        sessions = {"s1": {"title": "작업", "cwd": "/x",
+                           "model": "claude-haiku-4-5",
+                           "last_ts": iso(self.now - timedelta(minutes=1)),
+                           "last_ctx": 140_000}}
+        result = live.active_sessions(sessions, CFG, now=self.now)
+        self.assertEqual(result[0]["limit"], 200_000)
+        self.assertAlmostEqual(result[0]["ratio"], 0.70)
+        self.assertEqual(result[0]["status"], "caution")
+
+    def test_unknown_model_uses_the_configured_limit(self):
+        sessions = {"s1": {"title": "작업", "cwd": "/x", "model": "알 수 없는 모델",
+                           "last_ts": iso(self.now - timedelta(minutes=1)),
+                           "last_ctx": 140_000}}
+        result = live.active_sessions(sessions, CFG, now=self.now)
+        self.assertEqual(result[0]["limit"], 1_000_000)
+
+    def test_ratio_is_clamped_to_one(self):
+        """실측: 한도가 어긋난 트레이스에서 ratio 4.400025 — 카드가 440%였다."""
+        sessions = {"s1": {"title": "작업", "cwd": "/x",
+                           "model": "claude-haiku-4-5",
+                           "last_ts": iso(self.now - timedelta(minutes=1)),
+                           "last_ctx": 880_005}}
+        result = live.active_sessions(sessions, CFG, now=self.now)
+        self.assertEqual(result[0]["ratio"], 1.0)
+        self.assertEqual(result[0]["status"], "danger")
+
     def test_unparseable_timestamp_is_excluded(self):
         sessions = {"s1": {"title": "x", "cwd": "/x", "model": "m",
                            "last_ts": "not-a-date", "last_ctx": 1}}

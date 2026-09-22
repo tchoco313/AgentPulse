@@ -24,6 +24,7 @@ def refresh(projects_root, cache_path):
     files = scan.find_transcripts(projects_root)
     known = cache["files"]
     fresh = {}
+    dirty = False
 
     for path in files:
         try:
@@ -51,8 +52,15 @@ def refresh(projects_root, cache_path):
 
         fresh[path] = {"size": st.st_size, "mtime": st.st_mtime,
                        "offset": new_offset, "partial": partial}
+        dirty = True
+
+    if len(fresh) != len(known):
+        dirty = True  # 사라진 파일이 있다 — 아래에서 탈락하므로 저장해야 한다
 
     cache["files"] = fresh  # 사라진 파일은 여기서 탈락한다
-    cache_mod.save_cache(cache_path, cache)
+    if dirty:
+        # 바뀐 게 없으면 쓰지 않는다. 대시보드는 5초마다 묻고 실측 캐시는
+        # 105KB다 — 매번 쓰면 하루에 ~1.8GB를 ~/.claude에 쏟아붓는다.
+        cache_mod.save_cache(cache_path, cache)
 
     return [e["partial"] for e in fresh.values()], cache

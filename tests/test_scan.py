@@ -1,9 +1,9 @@
 import json
-import tempfile
 import unittest
 from pathlib import Path
 
 from pulse import scan
+from tests import tmpdir
 
 
 def assistant_line(ts="2026-09-22T01:00:00.000Z", session="s1", usage=None,
@@ -109,7 +109,7 @@ class TestParseLine(unittest.TestCase):
 
 class TestScanFile(unittest.TestCase):
     def setUp(self):
-        self.dir = Path(tempfile.mkdtemp())
+        self.dir = tmpdir()
         self.path = self.dir / "t.jsonl"
 
     def write(self, lines, mode="w"):
@@ -188,7 +188,7 @@ class TestScanFile(unittest.TestCase):
 
 class TestFindTranscripts(unittest.TestCase):
     def test_finds_jsonl_two_levels_down_and_sorts(self):
-        root = Path(tempfile.mkdtemp())
+        root = tmpdir()
         (root / "projB").mkdir()
         (root / "projA").mkdir()
         (root / "projB" / "b.jsonl").write_text("", encoding="utf-8")
@@ -201,7 +201,7 @@ class TestFindTranscripts(unittest.TestCase):
 
     def test_finds_subagent_transcripts(self):
         # 실측 117개 중 53개가 <프로젝트>/<세션>/subagents/ 아래에 있다
-        root = Path(tempfile.mkdtemp())
+        root = tmpdir()
         (root / "proj" / "sess" / "subagents").mkdir(parents=True)
         (root / "proj" / "main.jsonl").write_text("", encoding="utf-8")
         (root / "proj" / "sess" / "subagents" / "agent-x.jsonl").write_text(

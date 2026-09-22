@@ -1,14 +1,14 @@
 import json
-import tempfile
 import unittest
 from pathlib import Path
 
 from pulse import cache
+from tests import tmpdir
 
 
 class TestCache(unittest.TestCase):
     def setUp(self):
-        self.dir = Path(tempfile.mkdtemp())
+        self.dir = tmpdir()
         self.path = self.dir / "pulse-cache.json"
 
     def test_missing_file_gives_empty_cache(self):

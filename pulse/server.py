@@ -4,12 +4,32 @@ import threading
 import traceback
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urlsplit
 
 from pulse import aggregate as agg
 from pulse import inventory, live, pipeline
 
 HOST = "127.0.0.1"
+
+ALLOWED_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+"""Host 헤더로 허용하는 이름.
+
+127.0.0.1에만 묶는 것으로는 DNS 리바인딩을 막지 못한다. attacker.com이
+127.0.0.1로 재해석되면 그 페이지는 브라우저에게 같은 출처가 되고, /api/live가
+주는 세션 제목(Claude가 붙인 대화 제목)을 그대로 읽어간다. 실측으로
+`Host: evil.example.com`에 200을 돌려주던 경로다.
+"""
+
+
+def host_allowed(host_header):
+    """Host 헤더가 로컬을 가리키는가. 포트와 IPv6 대괄호를 벗겨 본다."""
+    if not host_header:
+        return False  # Host 없는 요청은 브라우저가 아니다 — 받지 않는다
+    try:
+        name = urlsplit("//" + host_header).hostname
+    except ValueError:
+        return False
+    return (name or "").lower() in ALLOWED_HOSTS
 
 
 class State:
@@ -20,7 +40,11 @@ class State:
         self.cfg = cfg
         self.projects_root = projects_root
         self.cache_path = cache_path
-        self.claude_json = claude_json or inventory.DEFAULT_CLAUDE_JSON
+        # `or`를 쓰면 빈 문자열 같은 falsy 주입값이 조용히 진짜 ~/.claude.json으로
+        # 떨어진다 — 테스트가 실제 홈을 건드리지 않게 하는 규칙이 막으려는 바로
+        # 그 일이다. skill_roots와 같은 `is None` 판정을 쓴다.
+        self.claude_json = (inventory.DEFAULT_CLAUDE_JSON
+                            if claude_json is None else claude_json)
         self.skill_roots = skill_roots
         self._lock = threading.Lock()
 
@@ -77,6 +101,11 @@ def _handler_class(state, web_dir):
             self.wfile.write(body)
 
         def do_GET(self):
+            # 라우팅보다 먼저. 정적 파일에도 건다 — API만 막으면 리바인딩된
+            # 페이지가 대시보드 자체를 실어 나를 수 있다.
+            if not host_allowed(self.headers.get("Host")):
+                return self._json({"error": "forbidden host"}, status=403)
+
             parsed = urlparse(self.path)
             route = parsed.path
 

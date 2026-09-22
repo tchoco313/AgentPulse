@@ -1,12 +1,13 @@
 import json
-import tempfile
 import threading
 import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest import mock
 
 from pulse import server
+from tests import tmpdir
 
 
 def line(ts="2026-09-22T01:00:00.000Z", session="s1", inp=1):
@@ -27,7 +28,7 @@ CFG = {"context_limit": 1_000_000, "warn_threshold": 0.85,
 
 class ServerTestCase(unittest.TestCase):
     def setUp(self):
-        self.root = Path(tempfile.mkdtemp())
+        self.root = tmpdir()
         self.projects = self.root / "projects" / "-Users-teo"
         self.projects.mkdir(parents=True)
         self.web = self.root / "web"
@@ -50,8 +51,16 @@ class ServerTestCase(unittest.TestCase):
         self.addCleanup(self.httpd.server_close)
         self.addCleanup(self.httpd.shutdown)
 
-    def get(self, path):
-        with urllib.request.urlopen(f"http://127.0.0.1:{self.port}{path}") as r:
+    def get(self, path, host=None):
+        """host를 주면 Host 헤더를 그걸로 덮어쓴다.
+
+        urllib은 Host를 URL에서 만든다 — 남의 Host를 흉내 내려면 요청 객체에
+        직접 박아야 한다.
+        """
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}")
+        if host is not None:
+            req.add_unredirected_header("Host", host)
+        with urllib.request.urlopen(req) as r:
             return r.status, r.read().decode("utf-8")
 
 
@@ -113,9 +122,60 @@ class TestApi(ServerTestCase):
         self.addCleanup(cm.exception.close)
         self.assertIn(cm.exception.code, (400, 403, 404))
 
+    def test_falsy_claude_json_is_not_swapped_for_the_real_one(self):
+        """주입한 경로가 falsy라도 진짜 ~/.claude.json으로 떨어지면 안 된다."""
+        state = server.State(cfg=CFG, projects_root=self.root / "projects",
+                             cache_path=self.root / "cache.json",
+                             claude_json="", skill_roots=[])
+        self.assertEqual(state.claude_json, "")
+
     def test_binds_loopback_only(self):
         self.start()
         self.assertEqual(self.httpd.server_address[0], "127.0.0.1")
+
+
+class TestHostHeader(ServerTestCase):
+    """DNS 리바인딩 차단.
+
+    127.0.0.1에 묶어도 attacker.com이 127.0.0.1로 재해석되면 브라우저에는
+    같은 출처가 된다 — 그 페이지가 /api/live를 읽으면 세션 제목(대화 제목)이
+    그대로 넘어간다. 실제로 Host: evil.example.com에 200을 주던 경로다.
+    """
+
+    def _get_expecting_403(self, path, host):
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            self.get(path, host=host)
+        self.addCleanup(cm.exception.close)
+        self.assertEqual(cm.exception.code, 403)
+
+    def test_foreign_host_on_api_is_403(self):
+        (self.projects / "a.jsonl").write_text(line() + "\n", encoding="utf-8")
+        self.start()
+        self._get_expecting_403("/api/live", "evil.example.com")
+
+    def test_foreign_host_on_static_file_is_403(self):
+        # 정적 파일에도 건다 — API만 막으면 페이지를 실어 나를 수 있다
+        self.start()
+        self._get_expecting_403("/", "evil.example.com")
+
+    def test_foreign_host_with_port_is_403(self):
+        self.start()
+        self._get_expecting_403("/api/summary?range=7d", "evil.example.com:8787")
+
+    def test_empty_host_is_403(self):
+        self.start()
+        self._get_expecting_403("/api/live", "")
+
+    def test_loopback_hosts_are_allowed(self):
+        self.start()
+        for host in (f"127.0.0.1:{self.port}", f"localhost:{self.port}",
+                     f"[::1]:{self.port}", "127.0.0.1"):
+            with self.subTest(host=host):
+                self.assertEqual(self.get("/api/live", host=host)[0], 200)
+
+    def test_normal_request_still_works(self):
+        self.start()
+        self.assertEqual(self.get("/")[0], 200)
 
 
 class TestPortFallback(ServerTestCase):
@@ -186,11 +246,17 @@ class TestApiErrorHandling(ServerTestCase):
         self.addCleanup(self.httpd.server_close)
         self.addCleanup(self.httpd.shutdown)
 
-        with self.assertRaises(urllib.error.HTTPError) as cm:
-            self.get("/api/summary?range=7d")
-        self.addCleanup(cm.exception.close)
-        self.assertEqual(cm.exception.code, 500)
-        self.assertEqual(json.loads(cm.exception.read())["error"], "RuntimeError")
+        # 일부러 터뜨리는 경로다. print_exc는 지우지 않는다 — 동시성 버그를
+        # 잡아낸 게 그 출력이다. 대신 이 테스트 동안만 막는다. 핸들러는 서버
+        # 스레드에서 도니 테스트 쪽 stderr를 돌려봐야 소용이 없다.
+        with mock.patch("pulse.server.traceback.print_exc") as printed:
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                self.get("/api/summary?range=7d")
+            self.addCleanup(cm.exception.close)
+            self.assertEqual(cm.exception.code, 500)
+            self.assertEqual(json.loads(cm.exception.read())["error"],
+                             "RuntimeError")
+            printed.assert_called_once()
 
 
 class TestEmptyEnvironment(ServerTestCase):

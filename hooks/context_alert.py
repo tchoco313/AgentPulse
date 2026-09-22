@@ -23,7 +23,9 @@ TAIL_BYTES = 512 * 1024
 
 
 def _human(n):
-    if n >= 1_000_000:
+    # 경계는 "반올림해서 1000이 되는 값"에 둔다 — 1_000_000에 두면 999,999가
+    # "1000K"로 나온다(web/app.js의 human()과 같은 이유, 같은 경계).
+    if n >= 999_950:
         return f"{n / 1_000_000:.1f}M"
     if n >= 1_000:
         return f"{round(n / 1_000)}K"
@@ -48,20 +50,23 @@ def _tail_lines(path, max_bytes=TAIL_BYTES):
     return lines
 
 
-def context_used(transcript_path):
-    """세션의 현재 컨텍스트 점유(토큰). 알 수 없으면 None.
+def last_assistant(transcript_path):
+    """마지막 사용자 턴의 (점유 토큰, 모델). 알 수 없으면 (None, None).
 
     Stop 훅 payload에는 context_window가 없다(실측). transcript_path는 있으므로
     마지막 assistant 레코드의 usage에서 직접 계산한다. 서브에이전트(isSidechain)
     레코드는 부모와 세션 id를 공유하므로 건너뛴다 — 그러지 않으면 서브에이전트의
     점유를 사용자 것으로 착각한다.
+
+    모델도 같이 낸다. 이미 읽고 있는 그 레코드에 들어 있고, 세션이 실제로
+    쓰는 컨텍스트 창을 고르는 데 필요하다.
     """
     if not transcript_path:
-        return None
+        return None, None
     try:
         lines = _tail_lines(transcript_path)
     except OSError:
-        return None
+        return None, None
 
     for raw in reversed(lines):
         if not raw.strip():
@@ -74,32 +79,64 @@ def context_used(transcript_path):
             continue
         if d.get("isSidechain"):
             continue
-        usage = (d.get("message") or {}).get("usage") or {}
+        msg = d.get("message") or {}
+        usage = msg.get("usage") or {}
         if not usage:
             continue
-        return (usage.get("input_tokens", 0)
+        used = (usage.get("input_tokens", 0)
                 + usage.get("cache_read_input_tokens", 0)
                 + usage.get("cache_creation_input_tokens", 0))
-    return None
+        return used, (msg.get("model") or None)
+    return None, None
 
 
-def should_alert(payload, cfg, seen, used):
-    """(발화할지, 갱신된 seen). 세션당 한 번만 발화한다."""
+def context_used(transcript_path):
+    """세션의 현재 컨텍스트 점유(토큰). 알 수 없으면 None."""
+    return last_assistant(transcript_path)[0]
+
+
+def limit_for(cfg, model):
+    """이 세션의 컨텍스트 창. 모르는 모델이면 설정값(cfg)으로 떨어진다.
+
+    import를 함수 안에서 한다 — 모듈 최상단에서 하면 pulse를 못 찾을 때
+    import 단계에서 죽고, 아래의 '무슨 일이 있어도 exit 0' 보호막 밖이다.
+    """
+    from pulse import config
+    return config.limit_for_model(model, cfg["context_limit"])
+
+
+def should_alert(payload, cfg, seen, used, model=None):
+    """(발화할지, 갱신된 seen). **한 번 찬 컨텍스트당** 한 번만 발화한다.
+
+    seen은 '이번 채움에서 이미 알렸다'는 표시이고, 점유가 caution 아래로
+    떨어지면(= 압축이 걸리면) 지워져 다시 장전된다. 세션당 한 번만 울리면
+    긴 세션에서 두 번째·세 번째 압축을 통째로 놓친다 — 실측으로 압축이
+    걸린 3개 세션 중 2개가 세 번씩 압축됐고, 그 4번을 전부 놓쳤다.
+
+    값은 존재 여부만 읽는다. 예전에는 알린 시점의 %를 넣어뒀지만 어디서도
+    읽지 않는 죽은 값이었다.
+    """
     session = payload.get("session_id")
-    limit = cfg["context_limit"]
+    limit = limit_for(cfg, model)
 
     if not session or used is None or not limit:
         return False, seen
-    if used / limit < cfg["warn_threshold"]:
-        return False, seen
-    if session in seen:
-        return False, seen
 
-    return True, {**seen, session: round(used / limit * 100, 1)}
+    ratio = used / limit
+    if ratio >= cfg["warn_threshold"]:
+        if session in seen:
+            return False, seen  # 같은 채움에 두 번 울리지 않는다
+        return True, {**seen, session: True}
+
+    if ratio < cfg["caution_threshold"] and session in seen:
+        # 압축이 걸렸거나 세션이 비워졌다 — 다음 채움을 위해 장전한다
+        return False, {k: v for k, v in seen.items() if k != session}
+
+    return False, seen
 
 
-def message(used, cfg):
-    limit = cfg["context_limit"]
+def message(used, cfg, model=None):
+    limit = limit_for(cfg, model)
     pct = used / limit * 100
     remaining = max(0, limit - used)
     title = "컨텍스트 경고"
@@ -115,6 +152,11 @@ def _notify(title, body):
               'end run')
     subprocess.run(["osascript", "-e", script, body, title],
                    capture_output=True, timeout=5)
+
+
+def _write_seen(path, seen):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(seen), encoding="utf-8")
 
 
 def main():
@@ -140,19 +182,23 @@ def main():
             seen = {}
     except (OSError, ValueError):
         seen = {}
+    prev_seen = dict(seen)
 
-    used = context_used(payload.get("transcript_path"))
-    fire, seen = should_alert(payload, cfg, seen, used)
+    used, model = last_assistant(payload.get("transcript_path"))
+    fire, seen = should_alert(payload, cfg, seen, used, model)
     if not fire:
+        # 발화하지 않아도 seen이 줄었을 수 있다(점유가 떨어져 장전된 경우).
+        # 그 상태를 기록해두지 않으면 다음 채움에서 또 억제된다.
+        if seen != prev_seen:
+            _write_seen(alerted_path, seen)
         return
 
     # 기록이 먼저다. 알린 뒤에 기록하면, 기록이 계속 실패할 때(디스크 가득,
     # 권한) 매 턴 알림이 다시 뜬다. 턴마다 울리는 알림은 한 번도 안 울리는
     # 것보다 나쁘다 — 사용자는 그냥 알림을 꺼버린다.
-    alerted_path.parent.mkdir(parents=True, exist_ok=True)
-    alerted_path.write_text(json.dumps(seen), encoding="utf-8")
+    _write_seen(alerted_path, seen)
 
-    title, body = message(used, cfg)
+    title, body = message(used, cfg, model)
     if args.dry_run:
         print(f"{title}: {body}")
     else:

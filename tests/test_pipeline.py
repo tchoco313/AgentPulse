@@ -1,10 +1,10 @@
 import json
-import tempfile
 import unittest
 from pathlib import Path
 
 from pulse import aggregate as agg
 from pulse import pipeline
+from tests import tmpdir
 
 
 def line(ts="2026-09-22T01:00:00.000Z", session="s1", inp=1, sidechain=False):
@@ -32,7 +32,7 @@ class TestSinceFor(unittest.TestCase):
 
 class TestRefresh(unittest.TestCase):
     def setUp(self):
-        self.root = Path(tempfile.mkdtemp())
+        self.root = tmpdir()
         self.proj = self.root / "projects" / "-Users-teo"
         self.proj.mkdir(parents=True)
         self.cache_path = self.root / "cache.json"
@@ -115,6 +115,51 @@ class TestRefresh(unittest.TestCase):
         self.assertEqual(summary["totals"]["input"], 10)  # 총계에 포함
         self.assertEqual(summary["sessions"]["s1"]["last_ts"],
                          "2026-09-22T01:00:00.000Z")   # 카드는 부모 시각
+
+    def _count_saves(self):
+        """save_cache 호출을 센다."""
+        calls = []
+        real = pipeline.cache_mod.save_cache
+
+        def counting(path, cache):
+            calls.append(path)
+            return real(path, cache)
+
+        pipeline.cache_mod.save_cache = counting
+        self.addCleanup(setattr, pipeline.cache_mod, "save_cache", real)
+        return calls
+
+    def test_unchanged_refresh_does_not_rewrite_the_cache(self):
+        """대시보드는 5초마다 묻는다. 실측 105KB 캐시를 매번 쓰면 하루 1.8GB다."""
+        self.write("a.jsonl", [line(inp=10)])
+        pipeline.refresh(self.root / "projects", self.cache_path)
+
+        saves = self._count_saves()
+        pipeline.refresh(self.root / "projects", self.cache_path)
+        pipeline.refresh(self.root / "projects", self.cache_path)
+
+        self.assertEqual(saves, [])
+
+    def test_new_lines_do_rewrite_the_cache(self):
+        self.write("a.jsonl", [line(inp=10)])
+        pipeline.refresh(self.root / "projects", self.cache_path)
+
+        saves = self._count_saves()
+        self.write("a.jsonl", [line(inp=5)], mode="a")
+        pipeline.refresh(self.root / "projects", self.cache_path)
+
+        self.assertEqual(len(saves), 1)
+
+    def test_deleted_file_rewrites_the_cache(self):
+        self.write("a.jsonl", [line(inp=10)])
+        self.write("b.jsonl", [line(inp=5)])
+        pipeline.refresh(self.root / "projects", self.cache_path)
+
+        saves = self._count_saves()
+        (self.proj / "b.jsonl").unlink()
+        pipeline.refresh(self.root / "projects", self.cache_path)
+
+        self.assertEqual(len(saves), 1)
 
     def test_empty_root_gives_empty_summary(self):
         partials, cache = pipeline.refresh(self.root / "projects", self.cache_path)

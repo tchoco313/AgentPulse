@@ -1,14 +1,14 @@
 import json
-import tempfile
 import unittest
 from pathlib import Path
 
 from pulse import inventory as inv
+from tests import tmpdir
 
 
 class TestInstalledMcpServers(unittest.TestCase):
     def test_reads_mcp_servers_key(self):
-        d = Path(tempfile.mkdtemp())
+        d = tmpdir()
         p = d / ".claude.json"
         p.write_text(json.dumps({"mcpServers": {"dbhub": {}, "other": {}}}),
                      encoding="utf-8")
@@ -18,7 +18,7 @@ class TestInstalledMcpServers(unittest.TestCase):
         self.assertEqual(inv.installed_mcp_servers("/nonexistent/.claude.json"), set())
 
     def test_broken_json_gives_empty_set(self):
-        d = Path(tempfile.mkdtemp())
+        d = tmpdir()
         p = d / ".claude.json"
         p.write_text("{broken", encoding="utf-8")
         self.assertEqual(inv.installed_mcp_servers(p), set())
@@ -26,7 +26,7 @@ class TestInstalledMcpServers(unittest.TestCase):
 
 class TestInstalledSkills(unittest.TestCase):
     def test_finds_skill_dirs_by_skill_md(self):
-        root = Path(tempfile.mkdtemp())
+        root = tmpdir()
         (root / "alpha").mkdir()
         (root / "alpha" / "SKILL.md").write_text("x", encoding="utf-8")
         (root / "beta" / "nested").mkdir(parents=True)
