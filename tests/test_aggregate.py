@@ -156,18 +156,26 @@ class TestFold(unittest.TestCase):
 
 class TestMerge(unittest.TestCase):
     def test_incremental_equals_whole(self):
-        """증분 경로와 전체 경로가 같은 답을 낸다 — 증분 스캔이 옳다는 근거."""
+        """증분 경로와 전체 경로가 같은 답을 낸다 — 증분 스캔이 옳다는 근거.
+
+        서브에이전트 이벤트를 섞어둔다. 세션 상태를 건너뛰는 분기가 생겼으니,
+        그 분기가 쪼개는 지점에 따라 달라지지 않는지도 여기서 걸린다.
+        """
         events = [
             usage("2026-09-20T01:00:00.000Z", input=10, output=1),
             tool("2026-09-20T01:00:00.000Z", "Bash"),
+            usage("2026-09-20T03:00:00.000Z", input=7, cache_read=70, sub=True),
+            tool("2026-09-20T03:00:00.000Z", "Read", sub=True),
             usage("2026-09-21T01:00:00.000Z", input=20, cache_read=5),
             tool("2026-09-21T01:00:00.000Z", "mcp__dbhub__execute_sql"),
+            {"kind": "activity", "ts": "2026-09-21T04:00:00.000Z",
+             "session": "s1", "sub": True},
             {"kind": "compact", "ts": "2026-09-21T02:00:00.000Z", "session": "s1",
              "trigger": "auto", "pre": 900, "post": 100},
         ]
         whole = agg.merge([agg.fold(events)])
 
-        incremental = agg.merge([agg.fold(events[:2]), agg.fold(events[2:])])
+        incremental = agg.merge([agg.fold(events[:3]), agg.fold(events[3:])])
 
         self.assertEqual(whole, incremental)
 
