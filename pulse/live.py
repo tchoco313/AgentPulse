@@ -32,8 +32,6 @@ def active_sessions(sessions, cfg, now=None):
 
     rows = []
     for sid, s in sessions.items():
-        if s.get("sub"):
-            continue  # 서브에이전트 세션 — 총계에는 있지만 카드에는 안 띄운다
         when = _parse(s.get("last_ts") or "")
         if when is None or when < cutoff:
             continue

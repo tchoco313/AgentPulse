@@ -43,12 +43,6 @@ class TestActiveSessions(unittest.TestCase):
         self.assertEqual(result[0]["status"], "ok")
         self.assertAlmostEqual(result[0]["ratio"], 0.36)
 
-    def test_subagent_session_is_excluded(self):
-        sessions = {"s1": {"title": "서브", "cwd": "/x", "model": "m",
-                           "last_ts": iso(self.now - timedelta(minutes=1)),
-                           "last_ctx": 100, "sub": True}}
-        self.assertEqual(live.active_sessions(sessions, CFG, now=self.now), [])
-
     def test_old_session_is_excluded(self):
         sessions = {"s1": {"title": "옛날", "cwd": "/x", "model": "m",
                            "last_ts": iso(self.now - timedelta(minutes=60)),
@@ -86,7 +80,7 @@ class TestActiveSessions(unittest.TestCase):
     def test_naive_now_does_not_raise(self):
         sessions = {"s1": {"title": "작업", "cwd": "/x", "model": "m",
                            "last_ts": iso(self.now - timedelta(minutes=1)),
-                           "last_ctx": 100, "sub": False}}
+                           "last_ctx": 100}}
 
         result = live.active_sessions(sessions, CFG,
                                       now=self.now.replace(tzinfo=None))

@@ -7,7 +7,8 @@ from pulse import scan
 
 
 def assistant_line(ts="2026-09-22T01:00:00.000Z", session="s1", usage=None,
-                   model="claude-opus-5", tools=(), cwd="/Users/teo"):
+                   model="claude-opus-5", tools=(), cwd="/Users/teo",
+                   sidechain=False):
     content = [{"type": "text", "text": "hi"}]
     for name, inp in tools:
         content.append({"type": "tool_use", "id": "t", "name": name, "input": inp})
@@ -16,7 +17,7 @@ def assistant_line(ts="2026-09-22T01:00:00.000Z", session="s1", usage=None,
         msg["usage"] = usage
     return json.dumps({
         "type": "assistant", "timestamp": ts, "sessionId": session,
-        "cwd": cwd, "message": msg,
+        "cwd": cwd, "isSidechain": sidechain, "message": msg,
     })
 
 
@@ -53,6 +54,17 @@ class TestParseLine(unittest.TestCase):
         self.assertEqual([t["name"] for t in tools], ["Bash", "Skill"])
         self.assertIsNone(tools[0]["skill"])
         self.assertEqual(tools[1]["skill"], "dataviz")
+
+    def test_sidechain_records_are_marked(self):
+        # 서브에이전트 트랜스크립트는 부모와 같은 sessionId를 쓴다.
+        # isSidechain만이 둘을 가르는 신호다.
+        ev = scan.parse_line(assistant_line(usage={}, sidechain=True,
+                                            tools=[("Bash", {})]))
+        self.assertTrue(all(e["sub"] for e in ev))
+
+    def test_non_sidechain_records_are_not_marked(self):
+        ev = scan.parse_line(assistant_line(usage={}, tools=[("Bash", {})]))
+        self.assertFalse(any(e["sub"] for e in ev))
 
     def test_compact_boundary(self):
         line = json.dumps({
@@ -197,6 +209,8 @@ class TestFindTranscripts(unittest.TestCase):
 
         found = scan.find_transcripts(root)
 
+        # 전체 경로로 정렬하므로 proj/main.jsonl 이
+        # proj/sess/subagents/agent-x.jsonl 보다 앞선다
         self.assertEqual([Path(p).name for p in found],
                          ["main.jsonl", "agent-x.jsonl"])
 

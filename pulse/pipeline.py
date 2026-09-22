@@ -9,11 +9,6 @@ from pulse import scan
 RANGES = {"7d": 7, "30d": 30}
 
 
-def is_subagent(path):
-    """서브에이전트 트랜스크립트는 <프로젝트>/<세션>/subagents/ 아래에 있다."""
-    return "/subagents/" in str(path)
-
-
 def since_for(range_key, today=None):
     """기간 키 -> 포함 시작일. 'all'이면 None."""
     if range_key == "all":
@@ -51,7 +46,7 @@ def refresh(projects_root, cache_path):
             partial = agg.empty_partial()
 
         events, new_offset, bad = scan.scan_file(path, offset)
-        partial = agg.fold(events, partial, subagent=is_subagent(path))
+        partial = agg.fold(events, partial)
         partial["bad_lines"] = partial.get("bad_lines", 0) + bad
 
         fresh[path] = {"size": st.st_size, "mtime": st.st_mtime,

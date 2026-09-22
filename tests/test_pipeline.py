@@ -7,10 +7,10 @@ from pulse import aggregate as agg
 from pulse import pipeline
 
 
-def line(ts="2026-09-22T01:00:00.000Z", session="s1", inp=1):
+def line(ts="2026-09-22T01:00:00.000Z", session="s1", inp=1, sidechain=False):
     return json.dumps({
         "type": "assistant", "timestamp": ts, "sessionId": session,
-        "cwd": "/Users/teo",
+        "cwd": "/Users/teo", "isSidechain": sidechain,
         "message": {"role": "assistant", "model": "claude-opus-5", "content": [],
                     "usage": {"input_tokens": inp}},
     })
@@ -99,19 +99,22 @@ class TestRefresh(unittest.TestCase):
         self.assertEqual(agg.merge(partials)["totals"]["input"], 10)
         self.assertEqual(len(cache["files"]), 1)
 
-    def test_subagent_transcripts_are_scanned_and_flagged(self):
+    def test_subagent_transcript_counts_but_does_not_move_parent_state(self):
+        # 서브에이전트 파일은 부모와 같은 sessionId를 쓴다(실측).
         sub_dir = self.proj / "sess" / "subagents"
         sub_dir.mkdir(parents=True)
         with open(sub_dir / "agent-x.jsonl", "w", encoding="utf-8") as f:
-            f.write(line(session="subsess", inp=4) + "\n")
-        self.write("a.jsonl", [line(session="mainsess", inp=6)])
+            f.write(line(ts="2026-09-22T05:00:00.000Z", session="s1", inp=4,
+                         sidechain=True) + "\n")
+        self.write("a.jsonl", [line(ts="2026-09-22T01:00:00.000Z",
+                                    session="s1", inp=6)])
 
         partials, _ = pipeline.refresh(self.root / "projects", self.cache_path)
         summary = agg.merge(partials)
 
         self.assertEqual(summary["totals"]["input"], 10)  # 총계에 포함
-        self.assertTrue(summary["sessions"]["subsess"]["sub"])
-        self.assertFalse(summary["sessions"]["mainsess"]["sub"])
+        self.assertEqual(summary["sessions"]["s1"]["last_ts"],
+                         "2026-09-22T01:00:00.000Z")   # 카드는 부모 시각
 
     def test_empty_root_gives_empty_summary(self):
         partials, cache = pipeline.refresh(self.root / "projects", self.cache_path)

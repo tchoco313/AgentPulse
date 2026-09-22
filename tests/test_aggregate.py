@@ -7,13 +7,14 @@ from pulse import aggregate as agg
 def usage(ts, session="s1", **kw):
     e = {"kind": "usage", "ts": ts, "session": session, "cwd": "/Users/teo",
          "model": "claude-opus-5", "input": 0, "output": 0,
-         "cache_read": 0, "cache_creation": 0}
+         "cache_read": 0, "cache_creation": 0, "sub": False}
     e.update(kw)
     return e
 
 
-def tool(ts, name, skill=None, session="s1"):
-    return {"kind": "tool", "ts": ts, "session": session, "name": name, "skill": skill}
+def tool(ts, name, skill=None, session="s1", sub=False):
+    return {"kind": "tool", "ts": ts, "session": session, "name": name,
+            "skill": skill, "sub": sub}
 
 
 class TestClassifyTool(unittest.TestCase):
@@ -108,13 +109,32 @@ class TestFold(unittest.TestCase):
         self.assertEqual(p["sessions"]["s1"]["last_ts"], "2026-09-22T02:00:00.000Z")
         self.assertEqual(p["sessions"]["s1"]["last_ctx"], 502)
 
-    def test_subagent_flag_marks_sessions(self):
-        p = agg.fold([usage("2026-09-22T01:00:00.000Z", input=1)], subagent=True)
-        self.assertTrue(p["sessions"]["s1"]["sub"])
+    def test_sidechain_tokens_count_but_do_not_move_session_state(self):
+        # 서브에이전트는 부모와 같은 sessionId를 쓴다. 토큰은 사용자가 쓴 것이
+        # 맞지만, 컨텍스트 점유는 부모 것이 아니다.
+        p = agg.fold([
+            usage("2026-09-22T01:00:00.000Z", input=1, cache_read=100),
+            usage("2026-09-22T02:00:00.000Z", input=5, cache_read=900, sub=True),
+        ])
+        day = agg.local_day("2026-09-22T01:00:00.000Z")
+        self.assertEqual(p["days"][day]["input"], 6)          # 토큰은 다 센다
+        self.assertEqual(p["sessions"]["s1"]["last_ctx"], 101)  # 사용자 값 유지
+        self.assertEqual(p["sessions"]["s1"]["last_ts"],
+                         "2026-09-22T01:00:00.000Z")
 
-    def test_default_is_not_subagent(self):
-        p = agg.fold([usage("2026-09-22T01:00:00.000Z", input=1)])
-        self.assertFalse(p["sessions"]["s1"]["sub"])
+    def test_sidechain_activity_does_not_move_last_ts(self):
+        p = agg.fold([
+            usage("2026-09-22T01:00:00.000Z", input=1),
+            {"kind": "activity", "ts": "2026-09-22T05:00:00.000Z",
+             "session": "s1", "sub": True},
+        ])
+        self.assertEqual(p["sessions"]["s1"]["last_ts"],
+                         "2026-09-22T01:00:00.000Z")
+
+    def test_sidechain_tool_calls_count_in_ranking(self):
+        p = agg.fold([tool("2026-09-22T01:00:00.000Z", "Bash", sub=True)])
+        day = agg.local_day("2026-09-22T01:00:00.000Z")
+        self.assertEqual(p["days"][day]["labels"]["tools"]["Bash"], 1)
 
     def test_title_event_names_session(self):
         p = agg.fold([{"kind": "title", "session": "s1", "title": "제목"}])
@@ -223,16 +243,15 @@ class TestMerge(unittest.TestCase):
         self.assertEqual(s["sessions"]["s1"]["last_ctx"], 901)
         self.assertEqual(s["totals"]["input"], 2)
 
-    def test_subagent_flag_survives_merge_and_tokens_still_count(self):
-        sub = agg.fold([usage("2026-09-22T01:00:00.000Z", session="a", input=7)],
-                       subagent=True)
-        main = agg.fold([usage("2026-09-22T01:00:00.000Z", session="b", input=3)])
+    def test_sidechain_tokens_survive_merge(self):
+        a = agg.fold([usage("2026-09-22T01:00:00.000Z", session="s1", input=7,
+                            sub=True)])
+        b = agg.fold([usage("2026-09-22T01:00:00.000Z", session="s1", input=3)])
 
-        s = agg.merge([sub, main])
+        s = agg.merge([a, b])
 
-        self.assertTrue(s["sessions"]["a"]["sub"])
-        self.assertFalse(s["sessions"]["b"]["sub"])
-        self.assertEqual(s["totals"]["input"], 10)  # 총계에는 둘 다 들어간다
+        self.assertEqual(s["totals"]["input"], 10)   # 총계에는 둘 다
+        self.assertEqual(s["sessions"]["s1"]["last_ctx"], 3)  # 카드는 부모 것만
 
     def test_compact_stats(self):
         s = agg.merge([agg.fold([

@@ -52,24 +52,22 @@ def _day_bucket(partial, day):
 def _session(partial, sid):
     return partial["sessions"].setdefault(sid, {
         "title": None, "cwd": "", "model": "", "last_ts": "", "last_ctx": None,
-        "sub": False,
     })
 
 
-def fold(events, partial=None, subagent=False):
+def fold(events, partial=None):
     """이벤트들을 부분집계에 접어 넣는다. partial을 주면 그 위에 누적한다.
 
-    subagent=True는 서브에이전트 트랜스크립트에서 온 이벤트라는 뜻이다. 사용량
-    총계에는 들어가지만 실시간 세션 카드에서는 빠진다 — 사용자가 알고 싶은 것은
-    자기 세션이 언제 압축되는가이고, 서브에이전트 컨텍스트는 손쓸 대상이 아니다.
+    `sub`가 참인 이벤트(서브에이전트)의 토큰과 도구 호출은 일별 집계에 들어간다 —
+    실제로 쓴 토큰이다. 다만 세션 상태(last_ts/last_ctx)는 갱신하지 않는다.
+    서브에이전트는 부모와 같은 sessionId를 쓰기 때문에, 갱신하면 사용자의 실시간
+    카드가 서브에이전트의 컨텍스트 점유를 사용자 것으로 표시한다.
     """
     p = empty_partial() if partial is None else partial
 
     for e in events:
         kind = e.get("kind")
         sid = e.get("session") or ""
-        if subagent and sid:
-            _session(p, sid)["sub"] = True
 
         if kind == "usage":
             day = local_day(e["ts"])
@@ -77,6 +75,8 @@ def fold(events, partial=None, subagent=False):
                 b = _day_bucket(p, day)
                 for k in ("input", "output", "cache_read", "cache_creation"):
                     b[k] += e.get(k, 0)
+            if e.get("sub"):
+                continue  # 토큰은 셌다. 세션 상태는 부모 것이므로 건드리지 않는다
             s = _session(p, sid)
             if e["ts"] >= s["last_ts"]:
                 s["last_ts"] = e["ts"]
@@ -105,6 +105,8 @@ def fold(events, partial=None, subagent=False):
             _session(p, sid)["title"] = e.get("title") or None
 
         elif kind == "activity":
+            if e.get("sub"):
+                continue
             s = _session(p, sid)
             if e["ts"] >= s["last_ts"]:
                 s["last_ts"] = e["ts"]
@@ -121,8 +123,6 @@ def _merge_sessions(target, incoming):
         # 제목은 한 번이라도 붙었으면 유지
         if s.get("title") and not cur.get("title"):
             cur["title"] = s["title"]
-        if s.get("sub"):
-            cur["sub"] = True  # 한 번이라도 서브에이전트면 서브에이전트다
         if s.get("last_ts", "") >= cur.get("last_ts", ""):
             cur["last_ts"] = s["last_ts"]
             if s.get("last_ctx") is not None:

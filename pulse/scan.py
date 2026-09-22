@@ -39,6 +39,7 @@ def parse_line(line):
     kind = d.get("type")
     session = d.get("sessionId") or ""
     ts = d.get("timestamp") or ""
+    sub = bool(d.get("isSidechain"))
 
     if kind == "assistant":
         msg = d.get("message") or {}
@@ -50,6 +51,7 @@ def parse_line(line):
             "output": _int(usage, "output_tokens"),
             "cache_read": _int(usage, "cache_read_input_tokens"),
             "cache_creation": _int(usage, "cache_creation_input_tokens"),
+            "sub": sub,
         }]
         for block in msg.get("content") or []:
             if isinstance(block, dict) and block.get("type") == "tool_use":
@@ -59,6 +61,7 @@ def parse_line(line):
                     "kind": "tool", "ts": ts, "session": session,
                     "name": block.get("name") or "",
                     "skill": skill if isinstance(skill, str) else None,
+                    "sub": sub,
                 })
         return events
 
@@ -75,7 +78,7 @@ def parse_line(line):
                  "title": d.get("aiTitle") or ""}]
 
     if kind == "user":
-        return [{"kind": "activity", "ts": ts, "session": session}]
+        return [{"kind": "activity", "ts": ts, "session": session, "sub": sub}]
 
     return None
 
