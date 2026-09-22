@@ -1619,6 +1619,16 @@ class TestActiveSessions(unittest.TestCase):
         result = live.active_sessions(sessions, CFG, now=self.now)
         self.assertEqual([r["session"] for r in result], ["high", "low"])
 
+    def test_naive_now_does_not_raise(self):
+        sessions = {"s1": {"title": "작업", "cwd": "/x", "model": "m",
+                           "last_ts": iso(self.now - timedelta(minutes=1)),
+                           "last_ctx": 100, "sub": False}}
+
+        result = live.active_sessions(sessions, CFG,
+                                      now=self.now.replace(tzinfo=None))
+
+        self.assertEqual(len(result), 1)
+
     def test_unparseable_timestamp_is_excluded(self):
         sessions = {"s1": {"title": "x", "cwd": "/x", "model": "m",
                            "last_ts": "not-a-date", "last_ctx": 1}}
@@ -1668,6 +1678,10 @@ def _parse(ts):
 
 def active_sessions(sessions, cfg, now=None):
     now = datetime.now(timezone.utc) if now is None else now
+    if now.tzinfo is None:
+        # 순진한 datetime을 받아도 죽지 않는다 — last_ts는 항상 tz를 달고 오므로
+        # 그대로 비교하면 TypeError가 나고, 5초마다 도는 페이지가 멈춘다
+        now = now.replace(tzinfo=timezone.utc)
     cutoff = now - timedelta(minutes=cfg["active_window_minutes"])
     limit = cfg["context_limit"]
 
@@ -1704,7 +1718,7 @@ cd ~/Workspaces/13_AgentPulse
 python3 -m unittest tests.test_live -v
 ```
 
-Expected: PASS — 12 tests
+Expected: PASS — 13 tests
 
 - [ ] **Step 5: 커밋**
 
