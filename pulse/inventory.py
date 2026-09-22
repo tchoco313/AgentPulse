@@ -6,9 +6,15 @@ CLAUDE_DIR = Path.home() / ".claude"
 DEFAULT_CLAUDE_JSON = Path.home() / ".claude.json"
 DEFAULT_SKILL_ROOTS = [
     CLAUDE_DIR / "skills",
-    CLAUDE_DIR / "modes",
     CLAUDE_DIR / "plugins" / "cache",
 ]
+"""모드 번들(~/.claude/modes)은 일부러 뺀다.
+
+모드는 전환식이라 한 번에 하나만 로드되는데, 디스크에는 어느 쪽이 활성인지
+표시가 없다. 전부 세면 실측 기준 미사용이 314개가 되어(ecc 번들 하나가
+292개) 타일이 잡음이 된다. 사용자가 손댈 수 있는 것은 자기 스킬과 설치한
+플러그인 스킬이다.
+"""
 
 
 def installed_mcp_servers(claude_json_path=DEFAULT_CLAUDE_JSON):

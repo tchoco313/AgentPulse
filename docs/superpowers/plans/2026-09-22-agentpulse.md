@@ -1348,6 +1348,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 - Produces:
   - `pulse.inventory.installed_mcp_servers(claude_json_path) -> set[str]`
   - `pulse.inventory.installed_skills(roots: list) -> set[str]`
+    `roots`가 `None`이면 `DEFAULT_SKILL_ROOTS`. 빈 리스트는 "없음"이다.
   - `pulse.inventory.unused(summary_tools: dict, mcp: set, skills: set) -> dict`
     반환: `{"mcp": [str, ...], "skill": [str, ...], "count": int}` (각 리스트 정렬됨)
   - `pulse.inventory.DEFAULT_SKILL_ROOTS: list[Path]`
@@ -1396,6 +1397,14 @@ class TestInstalledSkills(unittest.TestCase):
 
     def test_missing_root_is_skipped(self):
         self.assertEqual(inv.installed_skills(["/nonexistent"]), set())
+
+
+class TestDefaultSkillRoots(unittest.TestCase):
+    def test_mode_bundles_are_not_counted(self):
+        """모드 번들을 세면 미사용이 314개가 되어 타일이 잡음이 된다(실측)."""
+        names = [p.name for p in inv.DEFAULT_SKILL_ROOTS]
+        self.assertNotIn("modes", names)
+        self.assertIn("skills", names)
 
 
 class TestUnused(unittest.TestCase):
@@ -1447,9 +1456,15 @@ CLAUDE_DIR = Path.home() / ".claude"
 DEFAULT_CLAUDE_JSON = Path.home() / ".claude.json"
 DEFAULT_SKILL_ROOTS = [
     CLAUDE_DIR / "skills",
-    CLAUDE_DIR / "modes",
     CLAUDE_DIR / "plugins" / "cache",
 ]
+"""모드 번들(~/.claude/modes)은 일부러 뺀다.
+
+모드는 전환식이라 한 번에 하나만 로드되는데, 디스크에는 어느 쪽이 활성인지
+표시가 없다. 전부 세면 실측 기준 미사용이 314개가 되어(ecc 번들 하나가
+292개) 타일이 잡음이 된다. 사용자가 손댈 수 있는 것은 자기 스킬과 설치한
+플러그인 스킬이다.
+"""
 
 
 def installed_mcp_servers(claude_json_path=DEFAULT_CLAUDE_JSON):
@@ -1498,7 +1513,7 @@ cd ~/Workspaces/13_AgentPulse
 python3 -m unittest tests.test_inventory -v
 ```
 
-Expected: PASS — 8 tests
+Expected: PASS — 9 tests
 
 - [ ] **Step 5: 커밋**
 
@@ -3137,6 +3152,9 @@ Expected: `Stop 훅 2 개`, 둘 다 나열되고 `OK`.
 - 실행법: `python3 pulse.py`, 기본 주소
 - 설정: `~/.claude/pulse-config.json`의 키와 기본값 (Global Constraints의 값 그대로)
 - **teo 님 환경의 실측 근거** — 모델이 `opus[1m]`이라 컨텍스트가 1M이고, 실제 압축은 967K 부근에서 걸렸으며, 그래서 경고 임계값이 85%라는 것. 통설인 "200K마다 압축"이 이 환경에 해당하지 않는다는 점.
+- **"기간 내 미사용"이 세는 범위** — `~/.claude/skills`와 설치된 플러그인 스킬,
+  그리고 `.claude.json`의 MCP 서버. `~/.claude/modes` 아래 모드 번들은 전환식이라
+  제외한다(전부 세면 314개가 되어 의미가 없다)
 - 이 도구가 건드리는 파일 목록(`pulse-cache.json`, `pulse-config.json`, `pulse-alerted.json`, 그리고 Task 11이 고친 `statusline.py`·`settings.json`과 그 백업 위치)
 - 원복 방법: 백업 파일을 되돌리고 settings.json에서 훅 항목을 지우면 된다는 것
 - 테스트 실행 명령

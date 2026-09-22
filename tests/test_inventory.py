@@ -39,6 +39,14 @@ class TestInstalledSkills(unittest.TestCase):
         self.assertEqual(inv.installed_skills(["/nonexistent"]), set())
 
 
+class TestDefaultSkillRoots(unittest.TestCase):
+    def test_mode_bundles_are_not_counted(self):
+        """모드 번들을 세면 미사용이 314개가 되어 타일이 잡음이 된다(실측)."""
+        names = [p.name for p in inv.DEFAULT_SKILL_ROOTS]
+        self.assertNotIn("modes", names)
+        self.assertIn("skills", names)
+
+
 class TestUnused(unittest.TestCase):
     def test_lists_installed_but_unused(self):
         summary_tools = {"mcp": [["dbhub", 5]], "skill": [["dataviz", 2]],
