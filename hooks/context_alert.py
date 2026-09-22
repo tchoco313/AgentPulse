@@ -6,6 +6,7 @@ Claude Code의 턴이 막힌다.
 """
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -18,6 +19,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 CLAUDE_DIR = Path.home() / ".claude"
 DEFAULT_ALERTED_PATH = CLAUDE_DIR / "pulse-alerted.json"
 
+TAIL_BYTES = 512 * 1024
+
 
 def _human(n):
     if n >= 1_000_000:
@@ -27,26 +30,78 @@ def _human(n):
     return str(n)
 
 
-def should_alert(payload, cfg, seen):
+def _tail_lines(path, max_bytes=TAIL_BYTES):
+    """파일 끝에서 최대 max_bytes만 읽어 줄 목록으로 돌려준다.
+
+    훅은 매 턴 돈다. 트랜스크립트는 수십 MB까지 자라므로 전체를 읽으면
+    턴마다 지연이 붙는다.
+    """
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        start = max(0, size - max_bytes)
+        f.seek(start)
+        data = f.read()
+    lines = data.split(b"\n")
+    if start:
+        lines = lines[1:]  # 잘렸을 첫 줄은 버린다
+    return lines
+
+
+def context_used(transcript_path):
+    """세션의 현재 컨텍스트 점유(토큰). 알 수 없으면 None.
+
+    Stop 훅 payload에는 context_window가 없다(실측). transcript_path는 있으므로
+    마지막 assistant 레코드의 usage에서 직접 계산한다. 서브에이전트(isSidechain)
+    레코드는 부모와 세션 id를 공유하므로 건너뛴다 — 그러지 않으면 서브에이전트의
+    점유를 사용자 것으로 착각한다.
+    """
+    if not transcript_path:
+        return None
+    try:
+        lines = _tail_lines(transcript_path)
+    except OSError:
+        return None
+
+    for raw in reversed(lines):
+        if not raw.strip():
+            continue
+        try:
+            d = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(d, dict) or d.get("type") != "assistant":
+            continue
+        if d.get("isSidechain"):
+            continue
+        usage = (d.get("message") or {}).get("usage") or {}
+        if not usage:
+            continue
+        return (usage.get("input_tokens", 0)
+                + usage.get("cache_read_input_tokens", 0)
+                + usage.get("cache_creation_input_tokens", 0))
+    return None
+
+
+def should_alert(payload, cfg, seen, used):
     """(발화할지, 갱신된 seen). 세션당 한 번만 발화한다."""
     session = payload.get("session_id")
-    window = payload.get("context_window") or {}
-    pct = window.get("used_percentage")
+    limit = cfg["context_limit"]
 
-    if not session or not isinstance(pct, (int, float)):
+    if not session or used is None or not limit:
         return False, seen
-    if pct / 100 < cfg["warn_threshold"]:
+    if used / limit < cfg["warn_threshold"]:
         return False, seen
     if session in seen:
         return False, seen
 
-    return True, {**seen, session: pct}
+    return True, {**seen, session: round(used / limit * 100, 1)}
 
 
-def message(payload, cfg):
-    pct = (payload.get("context_window") or {}).get("used_percentage") or 0
+def message(used, cfg):
     limit = cfg["context_limit"]
-    remaining = max(0, int(limit * (100 - pct) / 100))
+    pct = used / limit * 100
+    remaining = max(0, limit - used)
     title = "컨텍스트 경고"
     body = (f"컨텍스트 {pct:.0f}% 사용 · 약 {_human(remaining)} 남음. "
             f"정리하거나 새 세션으로 옮길 때입니다.")
@@ -86,7 +141,8 @@ def main():
     except (OSError, ValueError):
         seen = {}
 
-    fire, seen = should_alert(payload, cfg, seen)
+    used = context_used(payload.get("transcript_path"))
+    fire, seen = should_alert(payload, cfg, seen, used)
     if not fire:
         return
 
@@ -96,7 +152,7 @@ def main():
     alerted_path.parent.mkdir(parents=True, exist_ok=True)
     alerted_path.write_text(json.dumps(seen), encoding="utf-8")
 
-    title, body = message(payload, cfg)
+    title, body = message(used, cfg)
     if args.dry_run:
         print(f"{title}: {body}")
     else:
