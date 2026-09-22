@@ -2916,6 +2916,11 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 
 ### Task 10: 컨텍스트 경고 훅
 
+> **함께 처리하는 이월 항목 (룰링 R17):** `tests/test_aggregate.py`의
+> `test_incremental_equals_whole`에 서브에이전트 이벤트를 섞는 변경이 계획에
+> 반영돼 있다(Task 4 절). 세션 상태를 건너뛰는 분기가 분할 지점에 의존하지
+> 않는지 확인하는 것으로, 이 태스크와 함께 적용한다.
+
 **Files:**
 - Create: `hooks/context_alert.py`
 - Create: `tests/test_context_alert.py`
@@ -3001,11 +3006,12 @@ class TestMessage(unittest.TestCase):
 
 
 class TestScriptNeverFails(unittest.TestCase):
-    def run_script(self, stdin_text, alerted_path):
+    def run_script(self, stdin_text, alerted_path, cwd=None):
         return subprocess.run(
             [sys.executable, str(ROOT / "hooks" / "context_alert.py"),
              "--alerted-path", str(alerted_path), "--dry-run"],
-            input=stdin_text, text=True, capture_output=True, cwd=ROOT,
+            input=stdin_text, text=True, capture_output=True,
+            cwd=cwd or ROOT,
         )
 
     def test_broken_stdin_exits_zero(self):
@@ -3023,6 +3029,19 @@ class TestScriptNeverFails(unittest.TestCase):
         r = self.run_script(json.dumps(payload(pct=99.0)), d / "alerted.json")
         self.assertEqual(r.returncode, 0)
         self.assertIn("99", r.stdout)
+
+    def test_works_from_an_unrelated_cwd(self):
+        """Claude Code는 사용자의 프로젝트 디렉터리를 cwd로 훅을 실행한다.
+
+        프로젝트 루트에서만 돌려보면 sys.path가 우연히 맞아 통과한다 —
+        그래서 이 테스트가 없으면 훅이 실무에서 조용히 죽는 것을 못 잡는다.
+        """
+        d = Path(tempfile.mkdtemp())
+        r = self.run_script(json.dumps(payload(pct=99.0)),
+                            d / "alerted.json", cwd=d)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("99", r.stdout)
+        self.assertEqual(r.stderr, "")
 
     def test_unwritable_alerted_path_exits_zero(self):
         r = self.run_script(json.dumps(payload(pct=99.0)),
@@ -3061,6 +3080,11 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+
+# Claude Code는 훅을 **사용자의 프로젝트 디렉터리**를 cwd로 실행한다.
+# 이 줄이 없으면 `from pulse import config`가 실패하고, 아래에서 모든 예외를
+# 삼키도록 설계돼 있어 아무 알림도 안 뜬 채 조용히 끝난다.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 CLAUDE_DIR = Path.home() / ".claude"
 DEFAULT_ALERTED_PATH = CLAUDE_DIR / "pulse-alerted.json"
@@ -3160,7 +3184,7 @@ cd ~/Workspaces/13_AgentPulse
 python3 -m unittest tests.test_context_alert -v
 ```
 
-Expected: PASS — 13 tests
+Expected: PASS — 14 tests
 
 - [ ] **Step 5: 알림이 실제로 뜨는지 눈으로 확인한다**
 
