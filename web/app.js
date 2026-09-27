@@ -106,15 +106,21 @@ function drawChart(days) {
 
   const W = 900, H = 240, PAD_L = 44, PAD_B = 28, PAD_T = 12;
   const groups = ["mcp", "skill", "tools"];
-  const max = Math.max(1, ...days.map((d) => groups.reduce((a, g) => a + d.calls[g], 0)));
+  const peak = Math.max(1, ...days.map((d) => groups.reduce((a, g) => a + d.calls[g], 0)));
+  // 눈금은 딱 떨어지는 값(1·2·2.5·5 × 10^k)으로. 최댓값을 그대로 4등분하면
+  // 1,998 → 1,499 · 999가 되고, human()이 1,499를 "1K"로 반올림해 축이 2K·1K·999로 찍힌다.
+  const raw = peak / 4, mag = 10 ** Math.floor(Math.log10(raw));
+  const tickStep = Math.max(1, [1, 2, 2.5, 5, 10].map((m) => m * mag).find((s) => Number.isInteger(s) && s >= raw));
+  const max = tickStep * 4;
+  const axisLabel = (v) => v >= 1000 ? +(v / 1000).toFixed(1) + "K" : String(v);
   const step = (W - PAD_L) / days.length;
   const bw = Math.min(28, step * 0.6);
   const y = (v) => PAD_T + (H - PAD_T - PAD_B) * (1 - v / max);
 
-  const ticks = [0, 0.25, 0.5, 0.75, 1].map((f) => {
-    const v = Math.round(max * f);
+  const ticks = [0, 1, 2, 3, 4].map((k) => {
+    const v = tickStep * k;
     return `<line x1="${PAD_L}" x2="${W}" y1="${y(v)}" y2="${y(v)}" class="grid"/>
-            <text x="${PAD_L - 8}" y="${y(v) + 4}" class="ax" text-anchor="end">${human(v)}</text>`;
+            <text x="${PAD_L - 8}" y="${y(v) + 4}" class="ax" text-anchor="end">${axisLabel(v)}</text>`;
   }).join("");
 
   const bars = days.map((d, i) => {
