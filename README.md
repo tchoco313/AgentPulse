@@ -220,3 +220,7 @@ python3 -m unittest discover -s tests -q
 ```
 
 현재 207개 테스트가 통과한다. 경고도 트레이스백도 찍히지 않아야 정상이다.
+
+## 라이선스
+
+MIT — `LICENSE` 참고.
